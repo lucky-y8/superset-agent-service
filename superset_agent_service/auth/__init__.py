@@ -1,0 +1,2 @@
+"""Authentication and permission context."""
+
