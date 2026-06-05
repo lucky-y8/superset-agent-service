@@ -1,0 +1,38 @@
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Database
+sqlalchemy>=2.0.25
+psycopg[binary]>=3.1.16
+alembic>=1.13.1
+
+# Async Database Support
+aiosqlite>=0.19.0
+
+# Authentication & Security
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.6
+
+# Settings Management
+pydantic>=2.5.3
+pydantic-settings>=2.1.0
+pydantic[email]>=2.5.3
+
+# Email
+email-validator>=2.1.0
+
+# Monitoring (Optional)
+sentry-sdk>=1.40.0
+
+# CORS
+python-dotenv>=1.0.0
+
+# Testing (Optional - uncomment if needed)
+# pytest>=7.4.3
+# pytest-asyncio>=0.21.1
+# httpx>=0.26.0
+# pytest-cov>=4.1.0
+
+requests
