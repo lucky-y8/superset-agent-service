@@ -1,2 +1,4 @@
-"""Database infrastructure."""
+"""Database infrastructure.
 
+数据库基础设施包。
+"""

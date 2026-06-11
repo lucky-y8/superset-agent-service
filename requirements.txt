@@ -15,9 +15,10 @@ passlib[bcrypt]>=1.7.4
 python-multipart>=0.0.6
 pillow>=12.0.0
 
-# Agent runtime and guardrails
-langgraph>=0.2.0
-langchain-core>=0.2.0
+# Agent runtime and guardrails.  These minimums match the StateGraph API used
+# by superset_agent_service/agents/runtime.py.
+langgraph>=1.2.4
+langchain-core>=1.4.5
 sqlglot>=25.0.0
 
 # Optional observability integrations

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superset Agent Console</title>
+  <link rel="stylesheet" href="/static/debug.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">S</span>
+        <div>
+          <strong>Superset Agent</strong>
+          <span>Development Console</span>
+        </div>
+      </div>
+
+      <nav class="view-nav" aria-label="工作区">
+        <button class="nav-button active" type="button" data-view="chat-view">
+          <span aria-hidden="true">›_</span>
+          对话
+        </button>
+        <button class="nav-button" type="button" data-view="mcp-view">
+          <span aria-hidden="true">⌘</span>
+          MCP 工具
+        </button>
+        <button class="nav-button" type="button" data-view="trace-view">
+          <span aria-hidden="true">≡</span>
+          Run Trace
+        </button>
+      </nav>
+
+      <div class="connection-panel">
+        <div>
+          <span id="agent-status" class="status-dot"></span>
+          <span id="agent-status-text">Agent 检测中</span>
+        </div>
+        <div>
+          <span id="mcp-status" class="status-dot"></span>
+          <span id="mcp-status-text">MCP 检测中</span>
+        </div>
+        <div>
+          <span id="socket-status" class="status-dot"></span>
+          <span id="socket-status-text">实时通道连接中</span>
+        </div>
+        <button id="refresh-status" class="text-button" type="button">刷新状态</button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <section id="chat-view" class="app-view active">
+        <div class="chat-layout">
+          <div class="conversation">
+            <header class="view-header">
+              <div>
+                <h1>Agent 对话</h1>
+                <p>通过 WebSocket 实时查看 LangGraph 推理与 MCP 工具执行。</p>
+              </div>
+              <div class="header-actions">
+                <button id="clear-chat" class="secondary-button" type="button">清空对话</button>
+                <span id="run-state" class="run-state">空闲</span>
+              </div>
+            </header>
+
+            <div id="message-list" class="message-list" aria-live="polite">
+              <article class="message assistant-message">
+                <div class="message-avatar">S</div>
+                <div class="message-content">
+                  <strong>Superset Agent</strong>
+                  <p>可以查询仪表盘、图表、数据集和 SQL Lab。发送问题后，右侧会实时显示执行步骤。</p>
+                </div>
+              </article>
+            </div>
+
+            <form id="agent-form" class="composer">
+              <textarea id="question" rows="3" required placeholder="向 Superset Agent 提问...">请查询 Superset 中现有的仪表盘，返回前 5 个仪表盘的 ID、标题和发布状态。</textarea>
+
+              <details class="context-settings">
+                <summary>请求上下文</summary>
+                <div class="context-grid">
+                  <label>
+                    Dashboard ID
+                    <input id="dashboard-id" type="text" placeholder="可选">
+                  </label>
+                  <label>
+                    Chart ID
+                    <input id="chart-id" type="text" placeholder="可选">
+                  </label>
+                  <label>
+                    时间范围
+                    <input id="time-range" type="text" placeholder="例如 Last 7 days">
+                  </label>
+                  <label>
+                    Filters JSON
+                    <input id="filters" class="code-input" type="text" value="{}">
+                  </label>
+                  <label>
+                    User ID
+                    <input id="user-id" type="text" value="local-user">
+                  </label>
+                  <label>
+                    Tenant ID
+                    <input id="tenant-id" type="text" value="local">
+                  </label>
+                  <label>
+                    Roles
+                    <input id="roles" type="text" value="admin">
+                  </label>
+                </div>
+              </details>
+
+              <div class="composer-footer">
+                <span id="composer-hint">Enter 发送，Shift+Enter 换行</span>
+                <button id="send-agent" class="send-button" type="submit" title="发送请求">
+                  <span aria-hidden="true">↑</span>
+                  <span>发送</span>
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <aside class="activity-panel">
+            <div class="activity-header">
+              <div>
+                <h2>Activity</h2>
+                <span id="activity-run-id">等待运行</span>
+              </div>
+              <span id="activity-count">0 步</span>
+            </div>
+            <ol id="activity-list" class="activity-list">
+              <li class="activity-empty">发送请求后，执行步骤会实时显示在这里。</li>
+            </ol>
+          </aside>
+        </div>
+      </section>
+
+      <section id="mcp-view" class="app-view">
+        <header class="view-header compact">
+          <div>
+            <h1>MCP 工具</h1>
+            <p>检查工具 Schema，并在开发环境直接调用。</p>
+          </div>
+          <button id="load-tools" class="secondary-button" type="button">刷新工具</button>
+        </header>
+
+        <div class="tool-layout">
+          <div class="tool-form">
+            <label for="tool-name">工具名称</label>
+            <input id="tool-name" type="text" list="tool-options" placeholder="例如 health_check">
+            <datalist id="tool-options"></datalist>
+
+            <label for="tool-arguments">Arguments JSON</label>
+            <textarea id="tool-arguments" class="code-input" rows="14">{}</textarea>
+            <button id="call-tool" class="primary-button" type="button">调用工具</button>
+          </div>
+          <div class="tool-output">
+            <div class="output-heading">
+              <span id="mcp-server-summary">等待 MCP 状态检测...</span>
+              <strong id="tool-count">0 tools</strong>
+            </div>
+            <pre id="mcp-result">等待工具调用...</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="trace-view" class="app-view">
+        <header class="view-header compact">
+          <div>
+            <h1>Run Trace</h1>
+            <p>查询已完成或失败的持久化运行事件。</p>
+          </div>
+        </header>
+
+        <div class="trace-toolbar">
+          <input id="trace-run-id" type="text" placeholder="输入 run_id">
+          <button id="load-trace" class="primary-button" type="button">查询</button>
+        </div>
+        <div class="trace-meta">
+          <span>用户 <strong id="trace-user">-</strong></span>
+          <span>状态 <strong id="trace-status">-</strong></span>
+          <span>事件 <strong id="trace-count">0</strong></span>
+        </div>
+        <ol id="trace-timeline" class="trace-timeline">
+          <li class="trace-empty">等待查询...</li>
+        </ol>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/debug.js"></script>
+</body>
+</html>

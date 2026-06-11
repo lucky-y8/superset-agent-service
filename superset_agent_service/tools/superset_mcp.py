@@ -1,10 +1,18 @@
-"""Factory for creating a configured Superset MCP client."""
+"""Factory for creating a configured Superset MCP client.
+
+创建已配置 Superset MCP 客户端的工厂。
+"""
 
 from superset_agent_service.config import settings
 from superset_agent_service.tools.mcp_client import MCPClient
 
 
 def get_superset_mcp_client() -> MCPClient | None:
+    """Build an MCP client when an endpoint is configured, otherwise return None.
+
+    配置了端点时创建 MCP 客户端，否则返回 None。
+    """
+
     if settings.SUPERSET_MCP_URL is None:
         return None
     return MCPClient(

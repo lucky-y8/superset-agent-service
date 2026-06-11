@@ -19,6 +19,10 @@ env/
 *.swp
 *.swo
 
+# Local development server output
+.agent-dev.*.log
+.agent-server.*.log
+
 # 系统文件
 .DS_Store
 Thumbs.db

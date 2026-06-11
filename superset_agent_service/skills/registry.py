@@ -1,14 +1,32 @@
-"""Registry for selecting business skills before tool execution."""
+"""Registry for selecting business skills before tool execution.
+
+在执行工具之前用于选择业务技能的注册表。
+"""
 
 from superset_agent_service.skills.schemas import SkillDefinition
 
 
 class SkillRegistry:
+    """Store the business-oriented capabilities known by the Agent.
+
+    保存 Agent 已知的业务能力定义。
+    """
+
     def __init__(self) -> None:
+        """Create an empty skill registry.
+
+        创建一个空的技能注册表。
+        """
+
         self._skills: dict[str, SkillDefinition] = {}
 
     @classmethod
     def default(cls) -> "SkillRegistry":
+        """Build the initial set of analytics skills shipped with the service.
+
+        构建服务默认提供的分析类技能集合。
+        """
+
         registry = cls()
         registry.register(
             SkillDefinition(
@@ -40,11 +58,25 @@ class SkillRegistry:
         return registry
 
     def register(self, skill: SkillDefinition) -> None:
+        """Register or replace one skill by name.
+
+        按名称注册或替换一个技能。
+        """
+
         self._skills[skill.name] = skill
 
     def get(self, name: str) -> SkillDefinition:
+        """Return one registered skill by its exact name.
+
+        按精确名称返回一个已注册技能。
+        """
+
         return self._skills[name]
 
     def list_skills(self) -> list[SkillDefinition]:
-        return list(self._skills.values())
+        """Return all currently registered skills.
 
+        返回当前注册的全部技能。
+        """
+
+        return list(self._skills.values())
