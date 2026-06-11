@@ -5,9 +5,13 @@ DeepSeek 到 MCP Runtime 循环的单元测试。
 
 import unittest
 
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
 from superset_agent_service.agents.runtime import LangGraphRuntime
 from superset_agent_service.agents.schemas import AgentRequest
 from superset_agent_service.auth.schemas import PermissionContext
+from superset_agent_service.db.base import Base
 from superset_agent_service.runs.service import RunService
 from superset_agent_service.tools.registry import ToolRegistry
 
@@ -107,14 +111,40 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
     在不依赖外部网络服务的情况下验证 Runtime 图行为。
     """
 
+    async def asyncSetUp(self) -> None:
+        """Create an isolated database schema for each asynchronous test.
+
+        为每个异步测试创建相互隔离的数据库结构。
+        """
+
+        self.engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            poolclass=StaticPool,
+        )
+        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+    async def asyncTearDown(self) -> None:
+        """Dispose the isolated database engine after each test.
+
+        每个测试结束后释放隔离数据库引擎。
+        """
+
+        await self.engine.dispose()
+
     async def test_runtime_executes_mcp_tool_and_returns_final_answer(self):
         """Confirm one complete model-tool-model cycle and its trace events.
 
         验证一次完整的“模型-工具-模型”循环及其轨迹事件。
         """
 
-        runs = RunService()
+        runs = RunService(session_factory=self.sessions)
         runs.bind_run("test-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="列出仪表盘"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
         llm = FakeLLM()
         mcp = FakeMCP()
         runtime = LangGraphRuntime(
@@ -136,9 +166,9 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(llm.received_messages[1][-1]["role"], "tool")
 
-        event_types = [
-            event.event_type for event in RunService.get_trace("test-run").events
-        ]
+        trace = await RunService.get_trace("test-run", self.sessions)
+        self.assertIsNotNone(trace)
+        event_types = [event.event_type for event in trace.events]
         self.assertIn("tools_discovered", event_types)
         self.assertIn("tool_completed", event_types)
         self.assertIn("answer_generated", event_types)

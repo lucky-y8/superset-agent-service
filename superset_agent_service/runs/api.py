@@ -18,7 +18,7 @@ async def get_run_trace(run_id: str) -> RunTrace:
     返回已保存的运行轨迹；不存在时返回明确的错误。
     """
 
-    trace = RunService.get_trace(run_id)
+    trace = await RunService.get_trace(run_id)
     if trace is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return trace

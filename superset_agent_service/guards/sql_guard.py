@@ -5,6 +5,24 @@
 
 from dataclasses import dataclass
 
+import sqlglot
+from sqlglot import exp
+
+from superset_agent_service.config import settings
+
+
+FORBIDDEN_EXPRESSIONS = (
+    exp.Alter,
+    exp.Command,
+    exp.Create,
+    exp.Delete,
+    exp.Drop,
+    exp.Insert,
+    exp.Into,
+    exp.Merge,
+    exp.Update,
+)
+
 
 @dataclass(frozen=True)
 class SQLGuardResult:
@@ -19,21 +37,79 @@ class SQLGuardResult:
 
 
 class SQLGuard:
-    """Reject obvious write operations before SQL reaches a data source.
+    """Validate read-only SQL structurally and enforce a maximum row count.
 
-    在 SQL 到达数据源之前拒绝明显的写操作。
+    从语法结构上校验只读 SQL，并强制限制最大返回行数。
     """
 
-    def validate(self, sql: str) -> SQLGuardResult:
-        """Perform a lightweight read-only validation of one SQL statement.
+    def __init__(self, max_rows: int = settings.MAX_SQL_ROWS) -> None:
+        """Configure the largest result set that a query may request.
 
-        对一条 SQL 语句执行轻量级只读校验。
+        配置查询允许请求的最大结果集行数。
         """
 
-        normalized = sql.strip().lower()
-        if not normalized.startswith("select"):
-            return SQLGuardResult(allowed=False, reason="Only SELECT statements are allowed")
-        blocked = [" drop ", " delete ", " update ", " insert ", " alter ", " truncate "]
-        if any(token in f" {normalized} " for token in blocked):
-            return SQLGuardResult(allowed=False, reason="Statement contains blocked SQL keyword")
-        return SQLGuardResult(allowed=True, rewritten_sql=sql)
+        if max_rows < 1:
+            raise ValueError("max_rows must be greater than zero")
+        self.max_rows = max_rows
+
+    def validate(self, sql: str) -> SQLGuardResult:
+        """Parse one statement, reject writes, and add or clamp ``LIMIT``.
+
+        解析单条语句、拒绝写操作，并添加或收紧 ``LIMIT``。
+        """
+
+        if not sql.strip():
+            return SQLGuardResult(allowed=False, reason="SQL statement is empty")
+
+        try:
+            statements = sqlglot.parse(sql)
+        except sqlglot.errors.ParseError as exc:
+            return SQLGuardResult(
+                allowed=False,
+                reason=f"SQL could not be parsed: {exc}",
+            )
+
+        if len(statements) != 1:
+            return SQLGuardResult(
+                allowed=False,
+                reason="Exactly one SQL statement is allowed",
+            )
+
+        statement = statements[0]
+        if not isinstance(statement, exp.Query):
+            return SQLGuardResult(
+                allowed=False,
+                reason="Only read-only query statements are allowed",
+            )
+
+        forbidden = next(
+            (
+                node
+                for node in statement.walk()
+                if isinstance(node, FORBIDDEN_EXPRESSIONS)
+            ),
+            None,
+        )
+        if forbidden is not None:
+            return SQLGuardResult(
+                allowed=False,
+                reason=f"Statement contains forbidden operation: {forbidden.key.upper()}",
+            )
+
+        limit = statement.args.get("limit")
+        if limit is None:
+            statement = statement.limit(self.max_rows)
+        else:
+            limit_expression = limit.expression
+            if not isinstance(limit_expression, exp.Literal) or not limit_expression.is_int:
+                return SQLGuardResult(
+                    allowed=False,
+                    reason="LIMIT must be a fixed integer",
+                )
+            if int(limit_expression.this) > self.max_rows:
+                statement = statement.limit(self.max_rows, copy=False)
+
+        return SQLGuardResult(
+            allowed=True,
+            rewritten_sql=statement.sql(),
+        )

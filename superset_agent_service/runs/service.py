@@ -1,86 +1,115 @@
-"""In-memory run trace service used until database persistence is added.
+"""Database-backed service for durable Agent run traces.
 
-在接入数据库持久化之前使用的内存运行轨迹服务。
+使用数据库持久化 Agent 运行轨迹的服务。
 """
 
 from collections.abc import Awaitable, Callable
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
+
 from superset_agent_service.agents.schemas import AgentRequest
 from superset_agent_service.auth.schemas import PermissionContext
+from superset_agent_service.db.session import AsyncSessionLocal
+from superset_agent_service.runs.models import AgentRunEventModel, AgentRunModel
 from superset_agent_service.runs.schemas import RunEvent, RunTrace
 
 RunEventSink = Callable[[dict[str, object]], Awaitable[None]]
+SessionFactory = async_sessionmaker[AsyncSession]
 
 
 class RunService:
-    """Store run events and optionally publish them to a live client.
+    """Persist run events and optionally publish them to a live client.
 
-    保存运行事件，并可选择将其实时推送给客户端。
+    持久化运行事件，并可选择将其实时推送给客户端。
     """
 
-    _store: dict[str, RunTrace] = {}
+    def __init__(
+        self,
+        event_sink: RunEventSink | None = None,
+        session_factory: SessionFactory = AsyncSessionLocal,
+    ) -> None:
+        """Create an unbound service with database and event dependencies.
 
-    def __init__(self, event_sink: RunEventSink | None = None) -> None:
-        """Create an unbound run service with an optional event publisher.
-
-        创建尚未绑定具体运行、并带有可选事件发布器的服务。
+        创建尚未绑定具体运行的服务，并注入数据库会话和可选事件发布器。
         """
 
         self.run_id: str | None = None
         self.user_id: str | None = None
         self.event_sink = event_sink
+        self.session_factory = session_factory
 
     def bind_run(self, run_id: str, user_id: str) -> None:
-        """Bind this service instance to a newly created run trace.
+        """Bind identifiers before the run row is created by ``start_run``.
 
-        将当前服务实例绑定到一条新创建的运行轨迹。
+        在 ``start_run`` 创建数据库记录之前绑定运行标识。
         """
 
         self.run_id = run_id
         self.user_id = user_id
-        self._store[run_id] = RunTrace(run_id=run_id, user_id=user_id, status="created")
 
     async def start_run(
         self, request: AgentRequest, context: PermissionContext
     ) -> None:
-        """Record the initial request information for the bound run.
+        """Create the run and its initial event in one transaction.
 
-        记录当前运行的初始请求信息。
+        在同一个事务中创建运行记录及其初始事件。
         """
 
-        await self.record_event(
+        run_id, user_id = self._require_bound()
+        event = RunEvent(
             event_type="run_started",
             payload={"user_id": context.user_id, "question": request.question},
         )
+        async with self.session_factory() as session:
+            session.add(
+                AgentRunModel(
+                    run_id=run_id,
+                    user_id=user_id,
+                    status="created",
+                    events=[self._event_model(run_id, event)],
+                )
+            )
+            await session.commit()
+        await self._publish(event_type="run_event", event=event)
 
     async def complete_run(self, status: str = "completed") -> None:
-        """Mark the current run as completed and emit its final event.
+        """Update the run status and persist its final event atomically.
 
-        将当前运行标记为完成，并发送结束事件。
+        原子更新运行状态并持久化结束事件。
         """
 
-        self._current().status = status
-        await self.record_event(event_type="run_completed")
+        await self._set_status_and_record(
+            status=status,
+            event=RunEvent(event_type="run_completed"),
+        )
 
     async def fail_run(self, error: str) -> None:
-        """Mark the current run as failed and preserve the error message.
+        """Mark the run as failed and preserve its error message atomically.
 
-        将当前运行标记为失败，并保存错误信息。
+        原子地将运行标记为失败，并保存错误信息。
         """
 
-        self._current().status = "failed"
-        await self.record_event(event_type="run_failed", payload={"error": error})
+        await self._set_status_and_record(
+            status="failed",
+            event=RunEvent(event_type="run_failed", payload={"error": error}),
+        )
 
     async def record_event(
         self, event_type: str, payload: dict[str, object] | None = None
     ) -> None:
-        """Persist one event in memory and publish it to live listeners.
+        """Persist one event in the database and publish it to live listeners.
 
-        在内存中保存一条事件，并将其推送给实时监听者。
+        在数据库中保存一条事件，并将其推送给实时监听者。
         """
 
+        run_id, _ = self._require_bound()
         event = RunEvent(event_type=event_type, payload=payload or {})
-        self._current().events.append(event)
+        async with self.session_factory() as session:
+            await self._require_run(session, run_id)
+            session.add(self._event_model(run_id, event))
+            await session.commit()
         await self._publish(event_type="run_event", event=event)
 
     async def publish_transient(
@@ -105,24 +134,91 @@ class RunService:
             payload=payload or {},
         )
 
-    @classmethod
-    def get_trace(cls, run_id: str) -> RunTrace | None:
-        """Look up a run trace from the process-local store.
+    @staticmethod
+    async def get_trace(
+        run_id: str,
+        session_factory: SessionFactory = AsyncSessionLocal,
+    ) -> RunTrace | None:
+        """Load a complete run trace from durable database storage.
 
-        从当前进程的本地存储中查询运行轨迹。
+        从数据库持久化存储中加载完整运行轨迹。
         """
 
-        return cls._store.get(run_id)
+        async with session_factory() as session:
+            statement = (
+                select(AgentRunModel)
+                .options(selectinload(AgentRunModel.events))
+                .where(AgentRunModel.run_id == run_id)
+            )
+            run = await session.scalar(statement)
+            if run is None:
+                return None
+            return RunTrace(
+                run_id=run.run_id,
+                user_id=run.user_id,
+                status=run.status,
+                events=[
+                    RunEvent(
+                        event_type=event.event_type,
+                        payload=event.payload,
+                        created_at=event.created_at,
+                    )
+                    for event in run.events
+                ],
+            )
 
-    def _current(self) -> RunTrace:
-        """Return the bound trace and fail fast when no run is active.
+    async def _set_status_and_record(self, status: str, event: RunEvent) -> None:
+        """Persist a lifecycle status change and its matching event together.
 
-        返回当前绑定的轨迹；没有活动运行时立即报错。
+        在同一事务中持久化生命周期状态变化及其对应事件。
         """
 
-        if not self.run_id or self.run_id not in self._store:
+        run_id, _ = self._require_bound()
+        async with self.session_factory() as session:
+            run = await self._require_run(session, run_id)
+            run.status = status
+            session.add(self._event_model(run_id, event))
+            await session.commit()
+        await self._publish(event_type="run_event", event=event)
+
+    @staticmethod
+    async def _require_run(
+        session: AsyncSession,
+        run_id: str,
+    ) -> AgentRunModel:
+        """Load one run row and fail clearly when persistence is inconsistent.
+
+        加载一条运行记录；持久化状态不一致时给出明确错误。
+        """
+
+        run = await session.get(AgentRunModel, run_id)
+        if run is None:
+            raise RuntimeError(f"Run {run_id!r} has not been started")
+        return run
+
+    def _require_bound(self) -> tuple[str, str]:
+        """Return bound identifiers or fail before touching the database.
+
+        返回已绑定的标识；未绑定时在访问数据库前直接报错。
+        """
+
+        if not self.run_id or not self.user_id:
             raise RuntimeError("No active run is bound")
-        return self._store[self.run_id]
+        return self.run_id, self.user_id
+
+    @staticmethod
+    def _event_model(run_id: str, event: RunEvent) -> AgentRunEventModel:
+        """Convert the API event model into its persistence representation.
+
+        将 API 事件模型转换为对应的持久化模型。
+        """
+
+        return AgentRunEventModel(
+            run_id=run_id,
+            event_type=event.event_type,
+            payload=event.payload,
+            created_at=event.created_at,
+        )
 
     async def _publish(
         self,
