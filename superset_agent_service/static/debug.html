@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Superset Agent Console</title>
-  <link rel="stylesheet" href="/static/debug.css">
+  <link rel="stylesheet" href="/static/debug.css?v=20260617-1">
 </head>
 <body>
   <div class="app-shell">
@@ -129,6 +129,31 @@
               </div>
               <span id="activity-count">0 步</span>
             </div>
+            <section class="run-summary" aria-label="运行摘要">
+              <div class="summary-heading">
+                <span>运行摘要</span>
+                <button id="refresh-summary" class="summary-refresh" type="button">刷新</button>
+              </div>
+              <div class="summary-grid">
+                <div class="summary-card">
+                  <span>状态</span>
+                  <strong id="summary-status">等待</strong>
+                </div>
+                <div class="summary-card">
+                  <span>耗时</span>
+                  <strong id="summary-duration">-</strong>
+                </div>
+                <div class="summary-card">
+                  <span>Token</span>
+                  <strong id="summary-tokens">未返回</strong>
+                </div>
+                <div class="summary-card">
+                  <span>错误</span>
+                  <strong id="summary-error">无</strong>
+                </div>
+              </div>
+              <p id="summary-message" class="summary-message">发送请求后自动加载运行摘要。</p>
+            </section>
             <ol id="activity-list" class="activity-list">
               <li class="activity-empty">发送请求后，执行步骤会实时显示在这里。</li>
             </ol>
@@ -182,6 +207,36 @@
           <span>状态 <strong id="trace-status">-</strong></span>
           <span>事件 <strong id="trace-count">0</strong></span>
         </div>
+        <section class="trace-summary" aria-label="运行轨迹摘要">
+          <div class="trace-summary-card wide">
+            <span>问题</span>
+            <strong id="trace-question">-</strong>
+          </div>
+          <div class="trace-summary-card wide">
+            <span>最终回答</span>
+            <strong id="trace-answer">-</strong>
+          </div>
+          <div class="trace-summary-card">
+            <span>开始时间</span>
+            <strong id="trace-started-at">-</strong>
+          </div>
+          <div class="trace-summary-card">
+            <span>完成时间</span>
+            <strong id="trace-completed-at">-</strong>
+          </div>
+          <div class="trace-summary-card">
+            <span>耗时</span>
+            <strong id="trace-duration">-</strong>
+          </div>
+          <div class="trace-summary-card">
+            <span>Token</span>
+            <strong id="trace-tokens">未返回</strong>
+          </div>
+          <div class="trace-summary-card wide">
+            <span>错误</span>
+            <strong id="trace-error">无</strong>
+          </div>
+        </section>
         <ol id="trace-timeline" class="trace-timeline">
           <li class="trace-empty">等待查询...</li>
         </ol>
@@ -190,6 +245,6 @@
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="/static/debug.js"></script>
+  <script src="/static/debug.js?v=20260617-1"></script>
 </body>
 </html>

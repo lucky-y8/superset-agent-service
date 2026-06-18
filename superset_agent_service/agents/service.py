@@ -46,7 +46,7 @@ class AgentService:
 
         try:
             answer = await self.runtime.invoke(request=request, context=context)
-            await self.runs.complete_run(status="completed")
+            await self.runs.complete_run(status="completed", final_answer=answer)
             return AgentResponse(run_id=run_id, answer=answer, status="completed")
         except Exception as exc:
             # Record failure before re-raising so observability is never lost.

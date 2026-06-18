@@ -18,7 +18,7 @@ env/
 .vscode/
 *.swp
 *.swo
-
+.jbeval
 # Local development server output
 .agent-dev.*.log
 .agent-server.*.log

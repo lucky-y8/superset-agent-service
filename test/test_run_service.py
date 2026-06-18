@@ -49,7 +49,12 @@ class RunServicePersistenceTests(unittest.IsolatedAsyncioTestCase):
                 "tool_completed",
                 {"tool": "list_dashboards"},
             )
-            await writer.complete_run()
+            await writer.record_model_usage(
+                input_tokens=12,
+                output_tokens=8,
+                total_tokens=20,
+            )
+            await writer.complete_run(final_answer="找到 1 个仪表盘。")
             await first_engine.dispose()
 
             # A new engine simulates a restarted process using the same database.
@@ -68,10 +73,46 @@ class RunServicePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(trace)
         self.assertEqual(trace.status, "completed")
         self.assertEqual(trace.user_id, "learning-user")
+        self.assertEqual(trace.question, "查询仪表盘")
+        self.assertEqual(trace.final_answer, "找到 1 个仪表盘。")
+        self.assertIsNone(trace.error_message)
+        self.assertIsNotNone(trace.started_at)
+        self.assertIsNotNone(trace.completed_at)
+        self.assertIsNotNone(trace.duration_ms)
+        self.assertEqual(trace.input_tokens, 12)
+        self.assertEqual(trace.output_tokens, 8)
+        self.assertEqual(trace.total_tokens, 20)
         self.assertEqual(
             [event.event_type for event in trace.events],
             ["run_started", "tool_completed", "run_completed"],
         )
+
+    async def test_failed_run_persists_error_summary(self) -> None:
+        """Persist the final error message and timing for failed runs.
+
+        为失败运行持久化最终错误信息和耗时。
+        """
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        service = RunService(session_factory=sessions)
+        service.bind_run("failed-run", "learning-user")
+        await service.start_run(
+            AgentRequest(question="执行危险操作"),
+            PermissionContext(user_id="learning-user", roles=["admin"]),
+        )
+        await service.fail_run("boom")
+
+        trace = await RunService.get_trace("failed-run", sessions)
+        await engine.dispose()
+
+        self.assertEqual(trace.status, "failed")
+        self.assertEqual(trace.error_message, "boom")
+        self.assertIsNotNone(trace.completed_at)
+        self.assertIsNotNone(trace.duration_ms)
 
 
 if __name__ == "__main__":

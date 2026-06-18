@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "superset-agent-service"
     API_V1_PREFIX: str = "/api/v1"
     ENVIRONMENT: str = "local"
+    LOG_LEVEL: str = "INFO"
 
     SECRET_KEY: str = Field(default="change-me-in-env")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
@@ -36,6 +37,17 @@ class Settings(BaseSettings):
 
     SUPERSET_MCP_URL: str | None = None
     SUPERSET_MCP_TOKEN: str | None = None
+
+    # Superset token verification endpoint used by production Agent requests.
+    # 生产环境 Agent 请求使用的 Superset Token 校验接口地址。
+    SUPERSET_AGENT_TOKEN_VERIFY_URL: str | None = None
+    # Optional service-to-service secret sent only from Agent Service to Superset.
+    # Agent Service 调 Superset 校验接口时使用的可选服务间密钥。
+    SUPERSET_AGENT_SERVICE_KEY: str | None = None
+    # Cache successful verification results briefly to protect Superset from
+    # repeated checks during one active chat while keeping revocation reasonably fresh.
+    # 短暂缓存校验成功的结果，减少同一轮对话反复请求 Superset，同时让权限回收仍能较快生效。
+    AGENT_TOKEN_VERIFY_CACHE_SECONDS: int = 60
 
     # DeepSeek exposes an OpenAI-compatible chat-completions API.  Keeping
     # these names provider-neutral lets the Runtime switch to another
@@ -56,6 +68,30 @@ class Settings(BaseSettings):
         """Normalize an empty MCP URL so optional configuration works correctly.
 
         将空的 MCP URL 归一化为 None，确保可选配置判断正确。
+        """
+
+        if value == "":
+            return None
+        return value
+
+    @field_validator("SUPERSET_AGENT_TOKEN_VERIFY_URL", mode="before")
+    @classmethod
+    def empty_agent_verify_url_is_none(cls, value: str | None) -> str | None:
+        """Normalize an empty token verification URL to disabled production auth.
+
+        将空的 Token 校验地址归一化为 None，表示未开启生产认证接入。
+        """
+
+        if value == "":
+            return None
+        return value
+
+    @field_validator("SUPERSET_AGENT_SERVICE_KEY", mode="before")
+    @classmethod
+    def empty_agent_service_key_is_none(cls, value: str | None) -> str | None:
+        """Treat an empty service key as missing optional service authentication.
+
+        将空服务密钥视为未配置，避免发送无意义的空请求头。
         """
 
         if value == "":

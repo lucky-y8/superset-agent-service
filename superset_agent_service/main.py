@@ -4,6 +4,7 @@ Superset Agent Service 的 FastAPI 应用入口。
 """
 
 from contextlib import asynccontextmanager
+import logging
 from pathlib import Path
 
 import uvicorn
@@ -16,6 +17,24 @@ from superset_agent_service.api.router import api_router
 from superset_agent_service.config import settings
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def configure_logging() -> None:
+    """Configure project loggers so Agent and MCP debug logs reach the console.
+
+    配置项目日志器，让 Agent 与 MCP 调试日志能输出到控制台。
+    """
+
+    level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        force=False,
+    )
+    logging.getLogger("superset_agent_service").setLevel(level)
+
+
+configure_logging()
 
 
 @asynccontextmanager

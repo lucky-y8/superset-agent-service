@@ -12,6 +12,7 @@ from superset_agent_service.agents.runtime import LangGraphRuntime
 from superset_agent_service.agents.schemas import AgentRequest
 from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.db.base import Base
+from superset_agent_service.guards.sql_guard import SQLGuard
 from superset_agent_service.runs.service import RunService
 from superset_agent_service.tools.registry import ToolRegistry
 
@@ -22,7 +23,13 @@ class FakeLLM:
     第一次返回工具调用，收到工具结果后再返回最终答案。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        tool_name: str = "list_dashboards",
+        tool_arguments: str = '{"request":{"page":1}}',
+        final_answer: str = "找到 1 个仪表盘。",
+        usage_sequence: list[dict[str, int]] | None = None,
+    ) -> None:
         """Track invocation count and every conversation sent by the Runtime.
 
         记录调用次数以及 Runtime 发送的每组对话。
@@ -30,6 +37,10 @@ class FakeLLM:
 
         self.calls = 0
         self.received_messages = []
+        self.tool_name = tool_name
+        self.tool_arguments = tool_arguments
+        self.final_answer = final_answer
+        self.usage_sequence = usage_sequence or []
 
     async def complete(self, messages, tools, on_content_delta=None):
         """Simulate the two model turns required by a tool-calling workflow.
@@ -40,7 +51,7 @@ class FakeLLM:
         self.calls += 1
         self.received_messages.append(list(messages))
         if self.calls == 1:
-            return {
+            message = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
@@ -48,16 +59,29 @@ class FakeLLM:
                         "id": "call-1",
                         "type": "function",
                         "function": {
-                            "name": "list_dashboards",
-                            "arguments": '{"request":{"page":1}}',
+                            "name": self.tool_name,
+                            "arguments": self.tool_arguments,
                         },
                     }
                 ],
             }
-        answer = "找到 1 个仪表盘。"
+            self._attach_usage(message)
+            return message
         if on_content_delta is not None:
-            await on_content_delta(answer)
-        return {"role": "assistant", "content": answer}
+            await on_content_delta(self.final_answer)
+        message = {"role": "assistant", "content": self.final_answer}
+        self._attach_usage(message)
+        return message
+
+    def _attach_usage(self, message: dict[str, object]) -> None:
+        """Attach deterministic usage data for Runtime persistence tests.
+
+        为 Runtime 持久化测试附加确定性的用量数据。
+        """
+
+        index = self.calls - 1
+        if index < len(self.usage_sequence):
+            message["_usage"] = self.usage_sequence[index]
 
 
 class FakeMCP:
@@ -66,13 +90,14 @@ class FakeMCP:
     提供一个行为确定的内存 MCP 服务替身。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tool_name: str = "list_dashboards") -> None:
         """Collect tool calls so assertions can verify exact arguments.
 
         收集工具调用，便于断言精确参数。
         """
 
         self.calls = []
+        self.tool_name = tool_name
 
     async def list_tools(self):
         """Expose one dashboard tool with a representative input schema.
@@ -82,11 +107,19 @@ class FakeMCP:
 
         return [
             {
-                "name": "list_dashboards",
-                "description": "List dashboards",
+                "name": self.tool_name,
+                "description": f"Call {self.tool_name}",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"request": {"type": "object"}},
+                    "properties": {
+                        "request": {
+                            "type": "object",
+                            "properties": {
+                                "page": {"type": "integer"},
+                                "sql": {"type": "string"},
+                            },
+                        }
+                    },
                 },
             }
         ]
@@ -172,6 +205,223 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tools_discovered", event_types)
         self.assertIn("tool_completed", event_types)
         self.assertIn("answer_generated", event_types)
+
+    async def test_runtime_accumulates_model_usage_when_provider_returns_it(self):
+        """Confirm provider usage is accumulated on the persisted run.
+
+        验证模型服务返回的用量会累加保存到运行记录。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("usage-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="列出仪表盘"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+        llm = FakeLLM(
+            usage_sequence=[
+                {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27},
+            ]
+        )
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=FakeMCP(),
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="有哪些仪表盘？"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+
+        trace = await RunService.get_trace("usage-run", self.sessions)
+        self.assertEqual(trace.input_tokens, 30)
+        self.assertEqual(trace.output_tokens, 12)
+        self.assertEqual(trace.total_tokens, 42)
+
+    async def test_runtime_blocks_tool_when_policy_denies_access(self):
+        """Confirm non-admin users cannot execute tools outside their allow-list.
+
+        验证非管理员不能执行白名单之外的工具。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("policy-denied-run", "viewer-user")
+        await runs.start_run(
+            AgentRequest(question="列出仪表盘"),
+            PermissionContext(user_id="viewer-user", roles=["viewer"]),
+        )
+        llm = FakeLLM(final_answer="权限不足，无法调用工具。")
+        mcp = FakeMCP()
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+        )
+
+        answer = await runtime.invoke(
+            AgentRequest(question="有哪些仪表盘？"),
+            PermissionContext(user_id="viewer-user", roles=["viewer"]),
+        )
+
+        self.assertEqual(answer, "权限不足，无法调用工具。")
+        self.assertEqual(mcp.calls, [])
+        tool_message = llm.received_messages[1][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("Permission denied", tool_message["content"])
+
+        trace = await RunService.get_trace("policy-denied-run", self.sessions)
+        event_types = [event.event_type for event in trace.events]
+        self.assertIn("tool_blocked", event_types)
+
+    async def test_runtime_allows_non_admin_tool_from_allow_list(self):
+        """Confirm explicit tool allow-lists let non-admin users execute tools.
+
+        验证明示工具白名单允许非管理员执行指定工具。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("policy-allowed-run", "analyst-user")
+        await runs.start_run(
+            AgentRequest(question="列出仪表盘"),
+            PermissionContext(user_id="analyst-user", roles=["analyst"]),
+        )
+        llm = FakeLLM()
+        mcp = FakeMCP()
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="有哪些仪表盘？"),
+            PermissionContext(
+                user_id="analyst-user",
+                roles=["analyst"],
+                allowed_tools=["list_dashboards"],
+            ),
+        )
+
+        self.assertEqual(
+            mcp.calls,
+            [("list_dashboards", {"request": {"page": 1}})],
+        )
+
+    async def test_runtime_treats_admin_role_case_insensitively(self):
+        """Confirm Superset-style ``Admin`` role names can execute tools.
+
+        验证 Superset 风格的 ``Admin`` 角色名也可以执行工具。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("admin-case-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="列出仪表盘"),
+            PermissionContext(user_id="local-user", roles=["Admin"]),
+        )
+        mcp = FakeMCP()
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=FakeLLM(),
+            mcp=mcp,
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="有哪些仪表盘？"),
+            PermissionContext(user_id="local-user", roles=["Admin"]),
+        )
+
+        self.assertEqual(
+            mcp.calls,
+            [("list_dashboards", {"request": {"page": 1}})],
+        )
+
+    async def test_runtime_rewrites_sql_before_mcp_call(self):
+        """Confirm SQLGuard clamps excessive LIMIT values before MCP execution.
+
+        验证 SQLGuard 会在 MCP 执行前收紧过大的 LIMIT。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("sql-rewrite-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="执行 SQL"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+        llm = FakeLLM(
+            tool_name="run_sql",
+            tool_arguments='{"request":{"sql":"SELECT * FROM dashboards LIMIT 5000"}}',
+        )
+        mcp = FakeMCP(tool_name="run_sql")
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+            sql_guard=SQLGuard(max_rows=100),
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="执行 SQL"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+
+        self.assertEqual(len(mcp.calls), 1)
+        rewritten_sql = mcp.calls[0][1]["request"]["sql"]
+        self.assertIn("LIMIT 100", rewritten_sql)
+
+        trace = await RunService.get_trace("sql-rewrite-run", self.sessions)
+        event_types = [event.event_type for event in trace.events]
+        self.assertIn("sql_guard_rewritten", event_types)
+
+    async def test_runtime_blocks_unsafe_sql_before_mcp_call(self):
+        """Confirm unsafe SQL is returned as a tool error without calling MCP.
+
+        验证危险 SQL 会以工具错误返回，并且不会真正调用 MCP。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("sql-block-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="删除数据"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+        llm = FakeLLM(
+            tool_name="run_sql",
+            tool_arguments='{"request":{"sql":"DELETE FROM dashboards"}}',
+            final_answer="SQL 被安全策略拦截。",
+        )
+        mcp = FakeMCP(tool_name="run_sql")
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+        )
+
+        answer = await runtime.invoke(
+            AgentRequest(question="删除数据"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+
+        self.assertEqual(answer, "SQL 被安全策略拦截。")
+        self.assertEqual(mcp.calls, [])
+        tool_message = llm.received_messages[1][-1]
+        self.assertIn("SQLGuard blocked SQL", tool_message["content"])
+
+        trace = await RunService.get_trace("sql-block-run", self.sessions)
+        failed_events = [
+            event
+            for event in trace.events
+            if event.event_type == "tool_failed"
+        ]
+        self.assertTrue(failed_events)
 
     def test_mcp_schema_is_converted_to_function_tool(self):
         """Confirm MCP schemas are translated into model function definitions.

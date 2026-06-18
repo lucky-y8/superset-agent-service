@@ -49,4 +49,15 @@ class AgentSocketRequest(BaseModel):
 
     type: str = "run"
     request: AgentRequest
+    token: str | None = None
+    agent_token: str | None = None
+    access_token: str | None = None
     context: AgentSocketContext = Field(default_factory=AgentSocketContext)
+
+    def get_agent_token(self) -> str | None:
+        """Return the first supported Agent token field.
+
+        返回第一个可用的 Agent Token 字段。
+        """
+
+        return self.token or self.agent_token or self.access_token

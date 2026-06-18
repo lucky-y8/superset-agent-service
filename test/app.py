@@ -16,7 +16,7 @@ def index():
     """
 
     return {
-        "message": "hello ipv6",
+        "message": "hello ipv61111111111111",
         "client_ip": request.remote_addr,
         "hostname": socket.gethostname()
     }
@@ -27,8 +27,8 @@ if __name__ == "__main__":
     app.run(
         # Alternative host value for IPv6 experiments.
         # IPv6 实验时可使用的备用主机地址。
-        # host="::",
-        host="0.0.0.0",
-        port=30000,
+        host="::",
+        # host="0.0.0.0",
+        port=9000,
         debug=True
     )

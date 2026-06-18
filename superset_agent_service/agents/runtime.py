@@ -4,7 +4,9 @@
 """
 
 import asyncio
+from copy import deepcopy
 import json
+import logging
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -13,10 +15,14 @@ from superset_agent_service.agents.llm_client import OpenAICompatibleChatClient
 from superset_agent_service.agents.schemas import AgentRequest
 from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.config import settings
+from superset_agent_service.guards.policy_guard import PolicyGuard
+from superset_agent_service.guards.sql_guard import SQLGuard
 from superset_agent_service.runs.service import RunService
 from superset_agent_service.tools.mcp_client import MCPClient
 from superset_agent_service.tools.registry import ToolRegistry
 from superset_agent_service.tools.superset_mcp import get_superset_mcp_client
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """\
@@ -25,6 +31,14 @@ You are a Superset analytics assistant.
 Use the available MCP tools whenever the user asks about dashboards, charts,
 datasets, databases, SQL, reports, users, roles, or data stored in Superset.
 Never invent tool results. Follow each tool's JSON schema exactly.
+
+Identity rule:
+When the user asks about "me", "my account", "my role", or "current user",
+the authoritative identity is authenticated_request_context in the user
+message. Do not treat instance metadata, dev users, global role lists, or
+unrelated MCP tool results as the current user. If the authenticated context
+does not include real Superset role names, say that the role information was
+not returned by the authentication service instead of guessing.
 
 When a list tool supports select_columns, request every field needed to answer
 the user. For dashboard publication questions, list_dashboards must request
@@ -56,6 +70,7 @@ class AgentGraphState(TypedDict):
     messages: list[dict[str, Any]]
     model_tools: list[dict[str, Any]]
     pending_tool_calls: list[dict[str, Any]]
+    context: PermissionContext
     step: int
     answer: str | None
 
@@ -72,6 +87,8 @@ class LangGraphRuntime:
         runs: RunService,
         llm: OpenAICompatibleChatClient | None = None,
         mcp: MCPClient | None = None,
+        policy_guard: PolicyGuard | None = None,
+        sql_guard: SQLGuard | None = None,
     ):
         """Create the model, MCP, and graph dependencies used by each run.
 
@@ -87,6 +104,8 @@ class LangGraphRuntime:
             timeout_seconds=settings.MAX_RUN_SECONDS,
         )
         self.mcp = mcp or get_superset_mcp_client()
+        self.policy_guard = policy_guard or PolicyGuard()
+        self.sql_guard = sql_guard or SQLGuard()
         self.graph = self._build_graph()
 
     async def invoke(self, request: AgentRequest, context: PermissionContext) -> str:
@@ -108,6 +127,7 @@ class LangGraphRuntime:
             raise RuntimeError(
                 "SUPERSET_MCP_URL is not configured; Runtime cannot discover tools"
             )
+        self._bind_mcp_identity(context)
 
         # The outer timeout covers the complete reasoning run, including every
         # model request and MCP call.  Individual HTTP clients also have their
@@ -160,6 +180,7 @@ class LangGraphRuntime:
             ],
             "model_tools": model_tools,
             "pending_tool_calls": [],
+            "context": context,
             "step": 0,
             "answer": None,
         }
@@ -177,6 +198,22 @@ class LangGraphRuntime:
         if not isinstance(answer, str) or not answer.strip():
             raise RuntimeError("LangGraph completed without a final answer")
         return answer.strip()
+
+    def _bind_mcp_identity(self, context: PermissionContext) -> None:
+        """Attach the current user's bearer token to the MCP client when possible.
+
+        尽可能把当前用户的 Bearer Token 绑定到 MCP 客户端，避免用默认身份查询 Superset 数据。
+        """
+
+        if not context.mcp_bearer_token or self.mcp is None:
+            return
+        if hasattr(self.mcp, "bearer_token"):
+            self.mcp.bearer_token = context.mcp_bearer_token
+            logger.info(
+                "Bound MCP bearer token for user_id=%s username=%s",
+                context.user_id,
+                context.username,
+            )
 
     def _build_graph(self):
         """Compile the two-node reasoning graph used for every Agent run.
@@ -224,6 +261,7 @@ class LangGraphRuntime:
             state["model_tools"],
             on_content_delta=self._publish_answer_delta,
         )
+        await self._record_model_usage(assistant_message)
         messages = [*state["messages"], assistant_message]
         raw_tool_calls = assistant_message.get("tool_calls", [])
         tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
@@ -275,7 +313,12 @@ class LangGraphRuntime:
         # DeepSeek 一次可能请求多个相互独立的工具。顺序执行可保持轨迹确定性，
         # 也为后续加入逐工具权限检查预留了清晰位置。
         for tool_call in state["pending_tool_calls"]:
-            tool_messages.append(await self._execute_tool_call(tool_call))
+            tool_messages.append(
+                await self._execute_tool_call(
+                    tool_call=tool_call,
+                    context=state["context"],
+                )
+            )
 
         return {
             "messages": [*state["messages"], *tool_messages],
@@ -302,7 +345,39 @@ class LangGraphRuntime:
             payload={"delta": delta},
         )
 
-    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    async def _record_model_usage(self, assistant_message: dict[str, Any]) -> None:
+        """Persist model usage metrics when the provider includes them.
+
+        当模型服务返回用量信息时，将其持久化到运行记录。
+        """
+
+        usage = assistant_message.get("_usage")
+        if not isinstance(usage, dict):
+            return
+        await self.runs.record_model_usage(
+            input_tokens=self._optional_int(usage.get("prompt_tokens")),
+            output_tokens=self._optional_int(usage.get("completion_tokens")),
+            total_tokens=self._optional_int(usage.get("total_tokens")),
+        )
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        """Convert provider usage values to integers when possible.
+
+        在可能时将模型服务返回的用量值转换为整数。
+        """
+
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        return None
+
+    async def _execute_tool_call(
+        self,
+        tool_call: dict[str, Any],
+        context: PermissionContext,
+    ) -> dict[str, Any]:
         """Validate one model tool request, call MCP, and build a tool message.
 
         校验一次模型工具请求、调用 MCP，并构造 tool 消息。
@@ -331,19 +406,95 @@ class LangGraphRuntime:
         if not isinstance(arguments, dict):
             raise RuntimeError(f"Tool arguments for {name} must be a JSON object")
 
+        logger.info(
+            "Runtime tool requested: user_id=%s username=%s tool=%s arguments=%s",
+            context.user_id,
+            context.username,
+            name,
+            self._summarize_for_log(arguments),
+        )
+
+        if not self.policy_guard.can_use_tool(context=context, tool_name=name):
+            content = json.dumps(
+                {
+                    "error": f"Permission denied for tool {name}",
+                    "tool": name,
+                },
+                ensure_ascii=False,
+            )
+            await self.runs.record_event(
+                event_type="tool_blocked",
+                payload={
+                    "tool": name,
+                    "reason": "permission_denied",
+                    "user_id": context.user_id,
+                    "username": context.username,
+                    "roles": context.roles,
+                    "allowed_tools": context.allowed_tools,
+                },
+            )
+            return self._tool_message(call_id=call_id, name=name, content=content)
+
+        try:
+            guarded_arguments, sql_rewrite_events = self._guard_sql_arguments(
+                tool_name=name,
+                arguments=arguments,
+            )
+        except RuntimeError as exc:
+            content = json.dumps(
+                {"error": str(exc), "tool": name},
+                ensure_ascii=False,
+            )
+            await self.runs.record_event(
+                event_type="tool_failed",
+                payload={"tool": name, "error": str(exc)},
+            )
+            return self._tool_message(call_id=call_id, name=name, content=content)
+
+        for path in sql_rewrite_events:
+            await self._record_sql_event(
+                event_type="sql_guard_rewritten",
+                tool_name=name,
+                path=path,
+                detail={"max_rows": settings.MAX_SQL_ROWS},
+            )
+
         await self.runs.record_event(
             event_type="tool_started",
-            payload={"tool": name, "arguments": arguments},
+            payload={"tool": name, "arguments": guarded_arguments},
         )
 
         try:
-            result = await self.mcp.call_tool(name, arguments)
+            logger.info(
+                "Calling MCP tool: user_id=%s username=%s tool=%s arguments=%s",
+                context.user_id,
+                context.username,
+                name,
+                self._summarize_for_log(guarded_arguments),
+            )
+            result = await self.mcp.call_tool(name, guarded_arguments)
+            logger.info(
+                "MCP tool completed: user_id=%s username=%s tool=%s result=%s",
+                context.user_id,
+                context.username,
+                name,
+                self._summarize_for_log(result),
+            )
             content = json.dumps(result, ensure_ascii=False, default=str)
             await self.runs.record_event(
                 event_type="tool_completed",
-                payload={"tool": name},
+                payload={
+                    "tool": name,
+                    "result_summary": self._summarize_for_log(result),
+                },
             )
         except Exception as exc:
+            logger.exception(
+                "MCP tool failed: user_id=%s username=%s tool=%s",
+                context.user_id,
+                context.username,
+                name,
+            )
             # Returning a failed tool message gives the model a chance to
             # recover, choose another tool, or explain the failure to the user.
             # 将失败信息作为 tool 消息返回，可让模型尝试恢复、改用其他工具，
@@ -356,6 +507,117 @@ class LangGraphRuntime:
                 event_type="tool_failed",
                 payload={"tool": name, "error": str(exc)},
             )
+
+        return self._tool_message(call_id=call_id, name=name, content=content)
+
+    def _guard_sql_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[tuple[str, ...]]]:
+        """Validate and rewrite SQL-bearing tool arguments before MCP execution.
+
+        在执行 MCP 前校验并改写包含 SQL 的工具参数。
+        """
+
+        guarded = deepcopy(arguments)
+        rewritten_paths: list[tuple[str, ...]] = []
+
+        def visit(value: Any, path: tuple[str, ...]) -> Any:
+            if isinstance(value, dict):
+                for key, nested_value in list(value.items()):
+                    next_path = (*path, str(key))
+                    if self._is_sql_argument_key(str(key)) and isinstance(
+                        nested_value,
+                        str,
+                    ):
+                        value[key], rewritten = self._validate_sql_value(
+                            tool_name=tool_name,
+                            sql=nested_value,
+                            path=next_path,
+                        )
+                        if rewritten:
+                            rewritten_paths.append(next_path)
+                    else:
+                        value[key] = visit(nested_value, next_path)
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    value[index] = visit(item, (*path, str(index)))
+            return value
+
+        return visit(guarded, ()), rewritten_paths
+
+    async def _record_sql_event(
+        self,
+        event_type: str,
+        tool_name: str,
+        path: tuple[str, ...],
+        detail: dict[str, object],
+    ) -> None:
+        """Record one SQL guard decision using a stable event payload.
+
+        使用稳定的事件载荷记录一次 SQL Guard 决策。
+        """
+
+        await self.runs.record_event(
+            event_type=event_type,
+            payload={
+                "tool": tool_name,
+                "argument_path": ".".join(path),
+                **detail,
+            },
+        )
+
+    def _validate_sql_value(
+        self,
+        tool_name: str,
+        sql: str,
+        path: tuple[str, ...],
+    ) -> tuple[str, bool]:
+        """Return safe SQL or raise a clear error for the model to observe.
+
+        返回安全 SQL；不安全时抛出清晰错误供模型观察。
+        """
+
+        result = self.sql_guard.validate(sql)
+        if not result.allowed:
+            raise RuntimeError(
+                f"SQLGuard blocked SQL for {tool_name} at {'.'.join(path)}: "
+                f"{result.reason}"
+            )
+        rewritten_sql = result.rewritten_sql or sql
+        return rewritten_sql, rewritten_sql != sql
+
+    @staticmethod
+    def _is_sql_argument_key(key: str) -> bool:
+        """Identify argument names that are intended to carry executable SQL.
+
+        识别用于承载可执行 SQL 的参数名。
+        """
+
+        normalized = key.lower()
+        return normalized in {"sql", "sql_query", "query_sql", "statement"}
+
+    def _summarize_for_log(self, value: Any, max_length: int = 1200) -> str:
+        """Serialize and truncate values before writing them to logs.
+
+        在写入日志前序列化并截断内容，避免大结果刷爆终端。
+        """
+
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            text = str(value)
+        if len(text) <= max_length:
+            return text
+        return f"{text[:max_length]}...<truncated>"
+
+    @staticmethod
+    def _tool_message(call_id: str, name: str, content: str) -> dict[str, Any]:
+        """Build the OpenAI-compatible tool message returned to the model.
+
+        构造返回给模型的 OpenAI 兼容 tool 消息。
+        """
 
         return {
             "role": "tool",
@@ -406,7 +668,13 @@ class LangGraphRuntime:
             "chart_id": request.chart_id,
             "filters": request.filters,
             "time_range": request.time_range,
-            "request_user_id": context.user_id,
+            "authenticated_request_context": {
+                "user_id": context.user_id,
+                "username": context.username,
+                "roles": context.roles,
+                "allowed_tools": context.allowed_tools,
+                "allowed_dataset_ids": context.allowed_dataset_ids,
+            },
         }
         return (
             f"User question:\n{request.question}\n\n"

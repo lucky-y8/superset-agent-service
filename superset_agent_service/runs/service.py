@@ -4,6 +4,7 @@
 """
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -67,14 +68,20 @@ class RunService:
                 AgentRunModel(
                     run_id=run_id,
                     user_id=user_id,
+                    question=request.question,
                     status="created",
+                    started_at=event.created_at,
                     events=[self._event_model(run_id, event)],
                 )
             )
             await session.commit()
         await self._publish(event_type="run_event", event=event)
 
-    async def complete_run(self, status: str = "completed") -> None:
+    async def complete_run(
+        self,
+        status: str = "completed",
+        final_answer: str | None = None,
+    ) -> None:
         """Update the run status and persist its final event atomically.
 
         原子更新运行状态并持久化结束事件。
@@ -82,6 +89,7 @@ class RunService:
 
         await self._set_status_and_record(
             status=status,
+            final_answer=final_answer,
             event=RunEvent(event_type="run_completed"),
         )
 
@@ -93,8 +101,30 @@ class RunService:
 
         await self._set_status_and_record(
             status="failed",
+            error_message=error,
             event=RunEvent(event_type="run_failed", payload={"error": error}),
         )
+
+    async def record_model_usage(
+        self,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cost_usd: float | None = None,
+    ) -> None:
+        """Accumulate model usage metrics on the current run when available.
+
+        当模型返回用量信息时，将其累加到当前运行记录上。
+        """
+
+        run_id, _ = self._require_bound()
+        async with self.session_factory() as session:
+            run = await self._require_run(session, run_id)
+            run.input_tokens = self._add_optional(run.input_tokens, input_tokens)
+            run.output_tokens = self._add_optional(run.output_tokens, output_tokens)
+            run.total_tokens = self._add_optional(run.total_tokens, total_tokens)
+            run.cost_usd = self._add_optional_float(run.cost_usd, cost_usd)
+            await session.commit()
 
     async def record_event(
         self, event_type: str, payload: dict[str, object] | None = None
@@ -157,6 +187,16 @@ class RunService:
                 run_id=run.run_id,
                 user_id=run.user_id,
                 status=run.status,
+                question=run.question,
+                final_answer=run.final_answer,
+                error_message=run.error_message,
+                started_at=run.started_at,
+                completed_at=run.completed_at,
+                duration_ms=run.duration_ms,
+                input_tokens=run.input_tokens,
+                output_tokens=run.output_tokens,
+                total_tokens=run.total_tokens,
+                cost_usd=run.cost_usd,
                 events=[
                     RunEvent(
                         event_type=event.event_type,
@@ -167,16 +207,29 @@ class RunService:
                 ],
             )
 
-    async def _set_status_and_record(self, status: str, event: RunEvent) -> None:
+    async def _set_status_and_record(
+        self,
+        status: str,
+        event: RunEvent,
+        final_answer: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
         """Persist a lifecycle status change and its matching event together.
 
         在同一事务中持久化生命周期状态变化及其对应事件。
         """
 
         run_id, _ = self._require_bound()
+        completed_at = event.created_at
         async with self.session_factory() as session:
             run = await self._require_run(session, run_id)
             run.status = status
+            run.completed_at = completed_at
+            run.duration_ms = self._duration_ms(run.started_at, completed_at)
+            if final_answer is not None:
+                run.final_answer = final_answer
+            if error_message is not None:
+                run.error_message = error_message
             session.add(self._event_model(run_id, event))
             await session.commit()
         await self._publish(event_type="run_event", event=event)
@@ -219,6 +272,44 @@ class RunService:
             payload=event.payload,
             created_at=event.created_at,
         )
+
+    @staticmethod
+    def _duration_ms(started_at: datetime, completed_at: datetime) -> int:
+        """Calculate elapsed milliseconds while tolerating naive DB datetimes.
+
+        计算运行耗时毫秒数，并兼容数据库返回的不带时区时间。
+        """
+
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=UTC)
+        return max(0, int((completed_at - started_at).total_seconds() * 1000))
+
+    @staticmethod
+    def _add_optional(current: int | None, addition: int | None) -> int | None:
+        """Add nullable integer counters without inventing missing usage.
+
+        累加可空整数计数器，但不伪造缺失的用量数据。
+        """
+
+        if addition is None:
+            return current
+        return (current or 0) + addition
+
+    @staticmethod
+    def _add_optional_float(
+        current: float | None,
+        addition: float | None,
+    ) -> float | None:
+        """Add nullable floating-point counters without inventing cost data.
+
+        累加可空浮点计数器，但不伪造缺失的成本数据。
+        """
+
+        if addition is None:
+            return current
+        return (current or 0.0) + addition
 
     async def _publish(
         self,

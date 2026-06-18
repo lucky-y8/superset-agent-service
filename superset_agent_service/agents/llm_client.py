@@ -94,6 +94,7 @@ class OpenAICompatibleChatClient:
 
         if on_content_delta is not None:
             payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
             return await self._complete_stream(payload, on_content_delta)
 
         try:
@@ -126,6 +127,9 @@ class OpenAICompatibleChatClient:
         message = choices[0].get("message")
         if not isinstance(message, dict):
             raise LLMResponseError("Model response does not contain an assistant message")
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            message["_usage"] = usage
         return message
 
     async def _complete_stream(
@@ -147,6 +151,7 @@ class OpenAICompatibleChatClient:
 
         content_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] | None = None
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
@@ -168,6 +173,9 @@ class OpenAICompatibleChatClient:
                             continue
 
                         chunk = json.loads(data)
+                        chunk_usage = chunk.get("usage")
+                        if isinstance(chunk_usage, dict):
+                            usage = chunk_usage
                         choices = chunk.get("choices", [])
                         if not choices:
                             continue
@@ -220,4 +228,6 @@ class OpenAICompatibleChatClient:
             message["tool_calls"] = [
                 tool_calls[index] for index in sorted(tool_calls)
             ]
+        if usage is not None:
+            message["_usage"] = usage
         return message

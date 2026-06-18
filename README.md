@@ -467,7 +467,7 @@ FastAPI Agent Service
 
 - **SQLAlchemy Async**：异步数据库访问边界
 - **Alembic**：数据库迁移工具
-- **SQLite / PostgreSQL**：开发环境默认 SQLite，生产建议 PostgreSQL
+- **PostgreSQL + asyncpg**：持久化 Agent Run Trace，开发和生产使用同一套迁移流程
 
 ### Agent 能力
 
@@ -686,7 +686,7 @@ superset-agent-service/
 
 - Python 3.10+
 - pip
-- PostgreSQL，可选，生产建议使用
+- PostgreSQL 14+，用于持久化 Agent Run Trace
 - Superset 5.0+ MCP Server，可选，接入 Superset 时需要
 
 ### 2. 安装依赖
@@ -711,37 +711,126 @@ PROJECT_NAME=superset-agent-service
 ENVIRONMENT=local
 SECRET_KEY=change-me
 
-DATABASE_URL=sqlite+aiosqlite:///./superset_agent_service.db
+# 格式：postgresql+asyncpg://用户名:密码@主机:端口/数据库名
+DATABASE_URL=postgresql+asyncpg://postgres:your-password@127.0.0.1:5432/superset_agent_service
 
-SUPERSET_MCP_URL=
+SUPERSET_MCP_URL=http://127.0.0.1:9009/mcp
 SUPERSET_MCP_TOKEN=
 
-DEFAULT_MODEL_PROVIDER=openai
-DEFAULT_MODEL_NAME=gpt-4.1-mini
+SUPERSET_AGENT_TOKEN_VERIFY_URL=http://127.0.0.1:8088/api/v1/agent/token/verify
+SUPERSET_AGENT_SERVICE_KEY=
+
+OPENAI_BASE_URL=https://api.deepseek.com
+OPENAI_API_KEY=
+OPENAI_MODEL=deepseek-chat
 
 MAX_AGENT_STEPS=12
 MAX_RUN_SECONDS=120
 MAX_SQL_ROWS=1000
 ```
 
-接入 Superset MCP 时，配置：
+其中：
 
-```env
-SUPERSET_MCP_URL=http://localhost:5008/mcp
-SUPERSET_MCP_TOKEN=your-token
+- `DATABASE_URL`：Agent Service 自己使用的数据库连接，用于保存运行状态和事件。
+- `SUPERSET_MCP_URL`：Superset MCP 的 Streamable HTTP 地址。
+- `SUPERSET_MCP_TOKEN`：MCP 开启 Bearer Token 认证时填写；未开启可留空。
+- `SUPERSET_AGENT_TOKEN_VERIFY_URL`：Agent Service 调用 Superset 校验短期 Agent Token 的接口地址。配置后，HTTP 和 WebSocket Agent 请求都不再信任前端传入的 `user_id`、`roles`。
+- `SUPERSET_AGENT_SERVICE_KEY`：Agent Service 调 Superset 校验接口时携带的服务间密钥；如果 Superset 后端暂未校验该请求头，可以先留空。
+- `OPENAI_BASE_URL`：OpenAI 兼容模型接口地址，当前使用 DeepSeek。
+- `OPENAI_API_KEY`：模型 API Key，只写入本地 `.env`，不要提交到 Git。
+- `OPENAI_MODEL`：模型名称，当前使用 `deepseek-chat`。
+
+### 4. 创建 PostgreSQL 数据库
+
+先确认 PostgreSQL 服务已经启动，然后通过 Navicat、psql 或其他数据库工具执行：
+
+```sql
+CREATE DATABASE superset_agent_service;
 ```
 
-### 4. 启动应用
+这条命令只创建空数据库。项目表结构由 Alembic 管理，不需要手动创建
+`agent_runs` 或 `agent_run_events` 表。
 
-```bash
-uvicorn superset_agent_service.main:app --host 0.0.0.0 --port 8000 --reload
+### 5. 使用 Alembic 创建和迁移表结构
+
+以下命令都需要在项目根目录 `D:\ai_agent\superset-agent-service` 中执行。
+
+#### 首次建表或升级到最新版本
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+用途：
+
+- 读取 `.env` 中的 `DATABASE_URL` 并连接 PostgreSQL。
+- 按顺序执行尚未执行的迁移脚本。
+- 首次执行时创建 `alembic_version`、`agent_runs` 和 `agent_run_events`。
+- `head` 表示升级到当前代码包含的最新迁移版本。
+
+#### 查看数据库当前迁移版本
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic current
+```
+
+用途：查看数据库已经执行到哪个版本。当前项目正常应显示：
+
+```text
+20260611_0001 (head)
+```
+
+#### 查看全部迁移历史
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic history
+```
+
+用途：按顺序查看项目已有的迁移版本及其说明，排查数据库版本差异时使用。
+
+#### ORM 模型变化后生成新迁移
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "add run duration"
+```
+
+用途：比较 SQLAlchemy ORM 模型与当前数据库结构，自动生成一个新的迁移文件。
+生成后必须人工检查 `alembic/versions/` 中的脚本，再执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+注意：修改 ORM 模型后不要重复修改已有迁移，应新增迁移版本。
+
+#### 回退最近一次迁移
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic downgrade -1
+```
+
+用途：撤销最近执行的一次迁移。回退可能删除表或字段并造成数据丢失，执行前应先备份数据库。
+
+#### 只生成 SQL，不实际修改数据库
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head --sql
+```
+
+用途：输出 Alembic 即将执行的 SQL，适合上线前审查；该命令不会连接或修改数据库。
+
+### 6. 启动应用
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn superset_agent_service.main:app --host 127.0.0.1 --port 30000 --reload
 ```
 
 访问：
 
-- API 文档：http://localhost:8000/docs
-- OpenAPI JSON：http://localhost:8000/api/v1/openapi.json
-- 健康检查：http://localhost:8000/api/v1/health
+- Agent 调试页面：http://127.0.0.1:30000/debug
+- API 文档：http://127.0.0.1:30000/docs
+- OpenAPI JSON：http://127.0.0.1:30000/api/v1/openapi.json
+- 健康检查：http://127.0.0.1:30000/api/v1/health
 
 ## API 文档
 
@@ -765,9 +854,7 @@ GET /api/v1/health
 ```http
 POST /api/v1/agents/chat
 Content-Type: application/json
-X-User-Id: alice
-X-Tenant-Id: demo
-X-Roles: admin
+Authorization: Bearer <superset-issued-agent-token>
 
 {
   "question": "解释这个 dashboard 为什么成本上涨",
@@ -779,6 +866,27 @@ X-Roles: admin
   "time_range": "last 7 days"
 }
 ```
+
+生产环境中，`Authorization` 里的 Token 由 Superset 后端
+`/api/v1/agent/token/` 接口签发。Agent Service 收到请求后，会调用
+`SUPERSET_AGENT_TOKEN_VERIFY_URL` 指向的 Superset 校验接口获取真实用户身份，
+不会信任前端传入的 `user_id` 或 `roles`。
+
+WebSocket 请求建议每次运行时在消息体中携带 Token：
+
+```json
+{
+  "type": "run",
+  "token": "<superset-issued-agent-token>",
+  "request": {
+    "question": "请查询 Superset 中现有的仪表盘，返回前 5 个仪表盘的 ID、标题和发布状态。",
+    "filters": {}
+  }
+}
+```
+
+也兼容字段名 `agent_token` 或 `access_token`。不建议把 Token 放在 URL query
+里，因为 query 更容易进入代理或服务日志。
 
 响应：
 
@@ -972,10 +1080,10 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 ### 阶段 1：MVP
 
 1. 保留当前骨架
-2. 接入 Superset MCP tool list 和 tool call
-3. 把 `LangGraphRuntime.invoke()` 替换成简单 LangGraph workflow
-4. 记录 model_call、tool_call、run_completed 事件
-5. 把 run trace 从内存改成数据库
+2. 已接入 Superset MCP tool list 和 tool call
+3. 已实现 DeepSeek + LangGraph 工具调用 workflow
+4. 已记录 plan、tool_call、run_completed 等运行事件
+5. 已使用 SQLAlchemy + Alembic 持久化 Run Trace
 
 ### 阶段 2：可观测性
 
@@ -988,7 +1096,7 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 
 1. 接老系统登录或 Superset SSO
 2. 完善 RBAC 和 tenant 隔离
-3. 用 `sqlglot` 强化 SQL Guard
+3. 已使用 `sqlglot` AST 强化 SQL Guard，并限制最大返回行数
 4. 增加高风险工具审批
 5. 增加审计日志持久化
 
@@ -1004,7 +1112,7 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 
 - 当前 `legacy_user_service/` 是从旧项目改名保留下来的代码，后续可以迁移其中的用户注册、登录、JWT 能力。
 - 当前 `auth/dependencies.py` 通过请求头模拟登录用户，不适合生产。
-- 当前 `runs/service.py` 用内存字典存储 trace，服务重启后数据会丢失。
-- 当前 `SQLGuard` 只是基础字符串检查，生产环境必须改为 AST 解析。
+- 当前 `runs/service.py` 已异步写入数据库；生产环境应使用 PostgreSQL，并在部署前执行 `alembic upgrade head`。
+- 当前 `SQLGuard` 已使用 `sqlglot` 进行 AST 解析，可拒绝写操作、多语句和动态 LIMIT。
 - 当前 `MCPClient` 是最小占位实现，正式接入 Superset MCP 时要根据实际协议和认证方式调整。
 

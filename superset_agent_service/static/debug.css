@@ -585,6 +585,90 @@ pre {
   white-space: nowrap;
 }
 
+.run-summary {
+  padding: 14px 16px 16px;
+  background: #eef2f4;
+  border-bottom: 1px solid #d9dfe3;
+}
+
+.summary-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: #4d5b64;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.summary-refresh {
+  padding: 0;
+  color: #168b68;
+  font-size: 11px;
+  font-weight: 650;
+  background: transparent;
+  border: 0;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.summary-card,
+.trace-summary-card {
+  min-width: 0;
+  padding: 10px 11px;
+  background: #ffffff;
+  border: 1px solid #dce2e6;
+  border-radius: 6px;
+}
+
+.summary-card span,
+.trace-summary-card span {
+  display: block;
+  margin-bottom: 5px;
+  color: #7b8790;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.summary-card strong,
+.trace-summary-card strong {
+  display: block;
+  min-width: 0;
+  color: #252d33;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.summary-card strong[data-status="completed"] {
+  color: #08745a;
+}
+
+.summary-card strong[data-status="failed"],
+.summary-card strong[data-status="summary_error"] {
+  color: #a63e3b;
+}
+
+.summary-card strong[data-status="running"],
+.summary-card strong[data-status="created"],
+.summary-card strong[data-status="loading"] {
+  color: #746018;
+}
+
+.summary-message {
+  margin: 10px 0 0;
+  color: #6d7982;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .activity-list {
   margin: 0;
   padding: 18px;
@@ -768,6 +852,19 @@ pre {
   color: #2a3035;
 }
 
+.trace-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 16px 24px;
+  background: #eef2f4;
+  border-bottom: 1px solid #d9dfe3;
+}
+
+.trace-summary-card.wide {
+  grid-column: 1 / -1;
+}
+
 .trace-timeline {
   margin: 0;
   padding: 24px 32px 30px 58px;
@@ -946,6 +1043,14 @@ pre {
   .activity-panel {
     border-top: 1px solid #d9dfe3;
     border-left: 0;
+  }
+
+  .trace-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .trace-summary-card.wide {
+    grid-column: auto;
   }
 
   .context-grid,

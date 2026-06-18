@@ -27,4 +27,14 @@ class RunTrace(BaseModel):
     run_id: str
     user_id: str
     status: str
+    question: str | None = None
+    final_answer: str | None = None
+    error_message: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_usd: float | None = None
     events: list[RunEvent] = Field(default_factory=list)

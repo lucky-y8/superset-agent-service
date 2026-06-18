@@ -4,11 +4,12 @@ Agent 实时进度事件的 WebSocket 协议测试。
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from superset_agent_service.agents.schemas import AgentResponse
+from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.main import app
 
 
@@ -68,6 +69,9 @@ class AgentWebSocketTests(unittest.TestCase):
         with patch(
             "superset_agent_service.agents.api.AgentService",
             FakeStreamingAgentService,
+        ), patch(
+            "superset_agent_service.agents.api.settings.SUPERSET_AGENT_TOKEN_VERIFY_URL",
+            None,
         ):
             with TestClient(app) as client:
                 with client.websocket_connect("/api/v1/agents/ws") as socket:
@@ -98,6 +102,135 @@ class AgentWebSocketTests(unittest.TestCase):
                     final = socket.receive_json()
                     self.assertEqual(final["type"], "final")
                     self.assertEqual(final["response"]["status"], "completed")
+
+    def test_socket_uses_verified_token_context_when_configured(self):
+        """Ensure production auth ignores browser-supplied identity fields.
+
+        确认生产认证开启后，会忽略浏览器传入的身份字段。
+        """
+
+        captured_contexts = []
+
+        class CapturingAgentService(FakeStreamingAgentService):
+            """Capture the trusted context used by the API layer.
+
+            捕获 API 层传给 Runtime 的可信上下文。
+            """
+
+            async def chat(self, request, context):
+                """Record the context and return a deterministic response.
+
+                记录权限上下文，并返回固定响应。
+                """
+
+                captured_contexts.append(context)
+                return AgentResponse(run_id="run-2", answer="ok", status="completed")
+
+        verified_context = PermissionContext(
+            user_id="verified-user",
+            roles=["authenticated"],
+            allowed_tools=["list_dashboards"],
+        )
+
+        with patch(
+            "superset_agent_service.agents.api.AgentService",
+            CapturingAgentService,
+        ), patch(
+            "superset_agent_service.agents.api.settings.SUPERSET_AGENT_TOKEN_VERIFY_URL",
+            "http://superset.local/api/v1/agent/token/verify",
+        ), patch(
+            "superset_agent_service.agents.api.token_verifier.verify",
+            new=AsyncMock(return_value=verified_context),
+        ) as verify:
+            with TestClient(app) as client:
+                with client.websocket_connect("/api/v1/agents/ws") as socket:
+                    self.assertEqual(socket.receive_json(), {"type": "connected"})
+                    socket.send_json(
+                        {
+                            "type": "run",
+                            "token": "signed-token",
+                            "request": {
+                                "question": "list dashboards",
+                                "filters": {},
+                            },
+                            "context": {
+                                "user_id": "forged-admin",
+                                "tenant_id": "local",
+                                "roles": ["admin"],
+                            },
+                        }
+                    )
+
+                    final = socket.receive_json()
+                    self.assertEqual(final["type"], "final")
+
+        verify.assert_awaited_once_with("signed-token")
+        self.assertEqual(captured_contexts[0].user_id, "verified-user")
+        self.assertEqual(captured_contexts[0].roles, ["authenticated"])
+
+    def test_socket_accepts_query_token_for_connection_auth(self):
+        """Allow integrated Superset pages to authenticate the socket URL token.
+
+        允许集成到 Superset 的页面通过 WebSocket URL Token 完成连接认证。
+        """
+
+        captured_contexts = []
+
+        class CapturingAgentService(FakeStreamingAgentService):
+            """Capture the authenticated context reused by the socket.
+
+            捕获 WebSocket 复用的已认证上下文。
+            """
+
+            async def chat(self, request, context):
+                """Record context and return a deterministic response.
+
+                记录上下文并返回固定响应。
+                """
+
+                captured_contexts.append(context)
+                return AgentResponse(run_id="run-3", answer="ok", status="completed")
+
+        verified_context = PermissionContext(
+            user_id="query-user",
+            username="test2",
+            roles=["Gamma"],
+            allowed_tools=["list_dashboards"],
+            mcp_bearer_token="query-token",
+        )
+
+        with patch(
+            "superset_agent_service.agents.api.AgentService",
+            CapturingAgentService,
+        ), patch(
+            "superset_agent_service.agents.api.settings.SUPERSET_AGENT_TOKEN_VERIFY_URL",
+            "http://superset.local/api/v1/agent/token/verify",
+        ), patch(
+            "superset_agent_service.agents.api.token_verifier.verify",
+            new=AsyncMock(return_value=verified_context),
+        ) as verify:
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/api/v1/agents/ws?agent_token=query-token"
+                ) as socket:
+                    self.assertEqual(socket.receive_json(), {"type": "connected"})
+                    self.assertEqual(socket.receive_json(), {"type": "authenticated"})
+                    socket.send_json(
+                        {
+                            "type": "run",
+                            "request": {
+                                "question": "list dashboards",
+                                "filters": {},
+                            },
+                        }
+                    )
+
+                    final = socket.receive_json()
+                    self.assertEqual(final["type"], "final")
+
+        verify.assert_awaited_once_with("query-token")
+        self.assertEqual(captured_contexts[0].user_id, "query-user")
+        self.assertEqual(captured_contexts[0].mcp_bearer_token, "query-token")
 
 
 if __name__ == "__main__":

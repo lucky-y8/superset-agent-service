@@ -11,6 +11,7 @@ const state = {
   tools: [],
   activityCount: 0,
   activityEvents: [],
+  runSummary: null,
   reconnectTimer: null,
 };
 
@@ -23,6 +24,12 @@ const elements = {
   activityList: document.querySelector("#activity-list"),
   activityRunId: document.querySelector("#activity-run-id"),
   activityCount: document.querySelector("#activity-count"),
+  summaryStatus: document.querySelector("#summary-status"),
+  summaryDuration: document.querySelector("#summary-duration"),
+  summaryTokens: document.querySelector("#summary-tokens"),
+  summaryError: document.querySelector("#summary-error"),
+  summaryMessage: document.querySelector("#summary-message"),
+  refreshSummary: document.querySelector("#refresh-summary"),
   clearChat: document.querySelector("#clear-chat"),
   mcpResult: document.querySelector("#mcp-result"),
   mcpServerSummary: document.querySelector("#mcp-server-summary"),
@@ -35,6 +42,13 @@ const elements = {
   traceUser: document.querySelector("#trace-user"),
   traceStatus: document.querySelector("#trace-status"),
   traceCount: document.querySelector("#trace-count"),
+  traceQuestion: document.querySelector("#trace-question"),
+  traceAnswer: document.querySelector("#trace-answer"),
+  traceStartedAt: document.querySelector("#trace-started-at"),
+  traceCompletedAt: document.querySelector("#trace-completed-at"),
+  traceDuration: document.querySelector("#trace-duration"),
+  traceTokens: document.querySelector("#trace-tokens"),
+  traceError: document.querySelector("#trace-error"),
   toast: document.querySelector("#toast"),
 };
 
@@ -53,6 +67,103 @@ const activityLabels = {
 
 function pretty(value) {
   return JSON.stringify(value, null, 2);
+}
+
+function formatDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds)) {
+    return "未记录";
+  }
+  if (milliseconds < 1000) {
+    return `${milliseconds} ms`;
+  }
+  return `${(milliseconds / 1000).toFixed(2)} s`;
+}
+
+function formatTokens(trace) {
+  const total = trace?.total_tokens;
+  if (!Number.isFinite(total)) {
+    return "未返回";
+  }
+  const input = Number.isFinite(trace.input_tokens) ? trace.input_tokens : 0;
+  const output = Number.isFinite(trace.output_tokens) ? trace.output_tokens : 0;
+  return `${total} total | ${input} in / ${output} out`;
+}
+
+function formatDateTime(value) {
+  return value ? new Date(value).toLocaleString() : "-";
+}
+
+function formatSummaryText(value, maxLength = 220) {
+  if (!value) {
+    return "";
+  }
+  const text = String(value).replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function renderLiveSummary(trace, message = "") {
+  state.runSummary = trace || null;
+  const status = trace?.status || "等待";
+  elements.summaryStatus.textContent = status;
+  elements.summaryStatus.dataset.status = status;
+  elements.summaryDuration.textContent = formatDuration(trace?.duration_ms);
+  elements.summaryTokens.textContent = formatTokens(trace);
+  elements.summaryError.textContent =
+    formatSummaryText(trace?.error_message, 80) || "无";
+  elements.summaryMessage.textContent =
+    message || summaryMessageForTrace(trace);
+}
+
+function renderTraceSummary(trace) {
+  elements.traceQuestion.textContent = formatSummaryText(trace?.question) || "-";
+  elements.traceAnswer.textContent = formatSummaryText(trace?.final_answer) || "-";
+  elements.traceStartedAt.textContent = formatDateTime(trace?.started_at);
+  elements.traceCompletedAt.textContent = formatDateTime(trace?.completed_at);
+  elements.traceDuration.textContent = formatDuration(trace?.duration_ms);
+  elements.traceTokens.textContent = formatTokens(trace);
+  elements.traceError.textContent = formatSummaryText(trace?.error_message) || "无";
+}
+
+function summaryMessageForTrace(trace) {
+  if (!trace) {
+    return "发送请求后自动加载运行摘要。";
+  }
+  if (trace.error_message) {
+    return "运行失败，错误详情已保存到 Run Trace。";
+  }
+  if (trace.status === "completed") {
+    return "运行摘要已从持久化 Run Trace 加载。";
+  }
+  if (trace.status === "running" || trace.status === "created") {
+    return "运行中，完成后会自动刷新摘要。";
+  }
+  return "摘要已加载。";
+}
+
+async function refreshRunSummary(runId, showErrors = false) {
+  if (!runId) {
+    renderLiveSummary(null);
+    return null;
+  }
+  renderLiveSummary(state.runSummary || {status: "loading"}, "正在读取运行摘要...");
+  try {
+    const trace = await apiFetch(`/api/v1/runs/${encodeURIComponent(runId)}`);
+    renderLiveSummary(trace);
+    persistSession();
+    return trace;
+  } catch (error) {
+    renderLiveSummary(
+      {
+        status: "summary_error",
+        error_message: error.message,
+      },
+      "摘要加载失败。请确认数据库已执行 alembic upgrade head，并且当前服务使用同一个 DATABASE_URL。",
+    );
+    if (showErrors) {
+      showToast(error.message, true);
+    }
+    return null;
+  }
 }
 
 function parseJsonInput(element, label) {
@@ -146,6 +257,12 @@ function handleSocketMessage(message) {
 
   if (message.type === "run_event") {
     addActivity(message.event);
+    if (
+      ["run_completed", "run_failed"].includes(message.event?.event_type) &&
+      message.run_id
+    ) {
+      window.setTimeout(() => refreshRunSummary(message.run_id, true), 350);
+    }
     return;
   }
   if (message.type === "answer_delta") {
@@ -188,12 +305,14 @@ function startRun(question) {
   state.currentRunId = null;
   state.activityCount = 0;
   state.activityEvents = [];
+  state.runSummary = null;
   elements.sendAgent.disabled = true;
   elements.runState.textContent = "运行中";
   elements.runState.className = "run-state running";
   elements.activityRunId.textContent = "正在创建运行";
   elements.activityCount.textContent = "0 步";
   elements.activityList.replaceChildren();
+  renderLiveSummary({status: "running"}, "运行中，完成后自动加载摘要。");
 
   addMessage("user", question);
   state.currentAnswer = addMessage("assistant", "", true);
@@ -257,6 +376,7 @@ function finishRun(response) {
     state.currentAnswer.dataset.raw = response.answer;
     renderMarkdown(state.currentAnswer, response.answer);
   }
+  window.setTimeout(() => refreshRunSummary(response.run_id, true), 350);
   persistSession();
   showToast("Agent 运行完成");
 }
@@ -272,6 +392,10 @@ function failRun(error) {
     state.currentAnswer.textContent = message;
     state.currentAnswer.dataset.raw = message;
   }
+  renderLiveSummary({
+    status: "failed",
+    error_message: error,
+  }, "运行失败，摘要会在 Run Trace 写入后自动刷新。");
   persistSession();
   showToast(error, true);
 }
@@ -588,6 +712,7 @@ function persistSession() {
         activityEvents: state.activityEvents,
         runId: state.currentRunId,
         runState: elements.runState.textContent,
+        runSummary: state.runSummary,
       }),
     );
   } catch (error) {
@@ -640,6 +765,13 @@ function restoreSession() {
   if (saved.runState && saved.runState !== "运行中") {
     elements.runState.textContent = saved.runState;
   }
+  if (saved.runSummary) {
+    renderLiveSummary(saved.runSummary);
+  } else if (state.currentRunId) {
+    refreshRunSummary(state.currentRunId, false);
+  } else {
+    renderLiveSummary(null);
+  }
   scrollConversation();
 }
 
@@ -651,11 +783,14 @@ function clearConversation() {
   state.currentAnswer = null;
   state.activityCount = 0;
   state.activityEvents = [];
+  state.runSummary = null;
   elements.activityRunId.textContent = "等待运行";
   elements.activityCount.textContent = "0 步";
   elements.activityList.innerHTML =
     '<li class="activity-empty">发送请求后，执行步骤会实时显示在这里。</li>';
   elements.traceRunId.value = "";
+  renderLiveSummary(null);
+  renderTraceSummary(null);
   elements.runState.textContent = "空闲";
   elements.runState.className = "run-state";
   localStorage.removeItem(STORAGE_KEY);
@@ -766,6 +901,8 @@ async function loadTrace() {
     elements.traceUser.textContent = trace.user_id;
     elements.traceStatus.textContent = trace.status;
     elements.traceCount.textContent = trace.events.length;
+    renderTraceSummary(trace);
+    renderLiveSummary(trace);
     elements.traceTimeline.replaceChildren(
       ...trace.events.map((event) => {
         const item = document.createElement("li");
@@ -795,6 +932,9 @@ document.querySelector("#refresh-status").addEventListener("click", refreshStatu
 document.querySelector("#load-tools").addEventListener("click", loadTools);
 document.querySelector("#call-tool").addEventListener("click", callTool);
 document.querySelector("#load-trace").addEventListener("click", loadTrace);
+elements.refreshSummary.addEventListener("click", () => {
+  refreshRunSummary(state.currentRunId || elements.traceRunId.value.trim(), true);
+});
 elements.clearChat.addEventListener("click", clearConversation);
 elements.toolName.addEventListener("change", showSelectedToolSchema);
 elements.agentForm.addEventListener("submit", submitAgent);
