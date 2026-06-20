@@ -1,10 +1,12 @@
-"""Development endpoints for inspecting and calling the configured MCP server.
+﻿"""Development endpoints for inspecting and calling the configured MCP server.
 
 用于查看和调用已配置 MCP 服务的开发调试接口。
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from superset_agent_service.auth.dependencies import get_permission_context
+from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.config import settings
 from superset_agent_service.tools.mcp_client import MCPError, MCPTransportError
 from superset_agent_service.tools.schemas import (
@@ -50,6 +52,17 @@ def _require_client():
     return client
 
 
+def _bind_mcp_identity(client, context: PermissionContext):
+    """Attach the verified Superset Agent token to this MCP client.
+
+    将已校验的 Superset Agent Token 绑定到当前 MCP 客户端。
+    """
+
+    if context.mcp_bearer_token and hasattr(client, "bearer_token"):
+        client.bearer_token = context.mcp_bearer_token
+    return client
+
+
 def _gateway_error(exc: Exception) -> HTTPException:
     """Convert low-level transport/protocol failures into a stable API error.
 
@@ -61,13 +74,15 @@ def _gateway_error(exc: Exception) -> HTTPException:
 
 
 @router.get("/status", response_model=MCPServerInfo)
-async def get_mcp_status() -> MCPServerInfo:
+async def get_mcp_status(
+    context: PermissionContext = Depends(get_permission_context),
+) -> MCPServerInfo:
     """Perform an MCP handshake and report the visible tool count.
 
     执行 MCP 握手，并报告当前可见的工具数量。
     """
 
-    client = _require_client()
+    client = _bind_mcp_identity(_require_client(), context)
     try:
         initialization = await client.initialize()
         tools = await client.list_tools()
@@ -94,13 +109,15 @@ async def get_mcp_status() -> MCPServerInfo:
 
 
 @router.get("/tools", response_model=MCPToolListResponse)
-async def list_mcp_tools() -> MCPToolListResponse:
+async def list_mcp_tools(
+    context: PermissionContext = Depends(get_permission_context),
+) -> MCPToolListResponse:
     """List tools after normalizing the server's JSON Schema field names.
 
     规范化服务端 JSON Schema 字段名后返回工具列表。
     """
 
-    client = _require_client()
+    client = _bind_mcp_identity(_require_client(), context)
     try:
         tools = await client.list_tools()
     except (MCPTransportError, MCPError) as exc:
@@ -123,15 +140,19 @@ async def list_mcp_tools() -> MCPToolListResponse:
 
 
 @router.post("/call", response_model=MCPToolCallResponse)
-async def call_mcp_tool(request: MCPToolCallRequest) -> MCPToolCallResponse:
+async def call_mcp_tool(
+    request: MCPToolCallRequest,
+    context: PermissionContext = Depends(get_permission_context),
+) -> MCPToolCallResponse:
     """Call one visible MCP tool for development-time protocol verification.
 
     调用一个可见的 MCP 工具，用于开发阶段的协议验证。
     """
 
-    client = _require_client()
+    client = _bind_mcp_identity(_require_client(), context)
     try:
         result = await client.call_tool(request.name, request.arguments)
     except (MCPTransportError, MCPError) as exc:
         raise _gateway_error(exc) from exc
     return MCPToolCallResponse(name=request.name, result=result)
+
