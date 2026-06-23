@@ -62,6 +62,34 @@ class Settings(BaseSettings):
     MAX_RUN_SECONDS: int = 120
     MAX_SQL_ROWS: int = 1000
 
+    # Retrieval Augmented Generation configuration.
+    # RAG（检索增强生成）相关配置。
+    RAG_ENABLED: bool = False
+    RAG_TOP_K: int = 5
+    RAG_CHUNK_SIZE: int = 900
+    RAG_CHUNK_OVERLAP: int = 120
+
+    EMBEDDING_PROVIDER: str = "dashscope"
+    EMBEDDING_MODEL: str = "text-embedding-v4"
+    EMBEDDING_DIM: int = 1024
+    DASHSCOPE_API_KEY: str | None = None
+    DASHSCOPE_EMBEDDING_URL: str = (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
+    )
+
+    QDRANT_URL: str = "http://127.0.0.1:6333"
+    QDRANT_COLLECTION: str = "superset_agent_knowledge"
+    QDRANT_MEMORY_COLLECTION: str = "superset_agent_memory"
+    QDRANT_API_KEY: str | None = None
+    SEMANTIC_MEMORY_TOP_K: int = 5
+
+    OSS_REGION: str | None = None
+    OSS_ENDPOINT: str | None = None
+    OSS_BUCKET: str | None = None
+    OSS_ACCESS_KEY_ID: str | None = None
+    OSS_ACCESS_KEY_SECRET: str | None = None
+    OSS_PREFIX: str = "superset-agent-knowledge"
+
     @field_validator("SUPERSET_MCP_URL", mode="before")
     @classmethod
     def empty_mcp_url_is_none(cls, value: str | None) -> str | None:

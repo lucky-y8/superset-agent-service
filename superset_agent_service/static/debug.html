@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Superset Agent Console</title>
-  <link rel="stylesheet" href="/static/debug.css?v=20260617-1">
+  <link rel="stylesheet" href="/static/debug.css?v=20260622-2">
 </head>
 <body>
   <div class="app-shell">
@@ -19,12 +19,20 @@
 
       <nav class="view-nav" aria-label="工作区">
         <button class="nav-button active" type="button" data-view="chat-view">
-          <span aria-hidden="true">›_</span>
+          <span aria-hidden="true">>_</span>
           对话
         </button>
         <button class="nav-button" type="button" data-view="mcp-view">
           <span aria-hidden="true">⌘</span>
           MCP 工具
+        </button>
+        <button class="nav-button" type="button" data-view="knowledge-view">
+          <span aria-hidden="true">▦</span>
+          知识库
+        </button>
+        <button class="nav-button" type="button" data-view="memory-view">
+          <span aria-hidden="true">◌</span>
+          记忆
         </button>
         <button class="nav-button" type="button" data-view="trace-view">
           <span aria-hidden="true">≡</span>
@@ -42,6 +50,10 @@
           <span id="mcp-status-text">MCP 检测中</span>
         </div>
         <div>
+          <span id="token-status" class="status-dot"></span>
+          <span id="token-status-text">Token 未获取</span>
+        </div>
+        <div>
           <span id="socket-status" class="status-dot"></span>
           <span id="socket-status-text">实时通道连接中</span>
         </div>
@@ -56,20 +68,41 @@
             <header class="view-header">
               <div>
                 <h1>Agent 对话</h1>
-                <p>通过 WebSocket 实时查看 LangGraph 推理与 MCP 工具执行。</p>
+                <p>按 Superset 集成页的方式获取 Agent Token，并通过 WebSocket 实时查看执行步骤。</p>
               </div>
               <div class="header-actions">
+                <button id="refresh-token" class="secondary-button" type="button">刷新 Token</button>
                 <button id="clear-chat" class="secondary-button" type="button">清空对话</button>
                 <span id="run-state" class="run-state">空闲</span>
               </div>
             </header>
+
+            <section class="connection-settings" aria-label="连接设置">
+              <div class="settings-grid">
+                <label>
+                  Agent Service URL
+                  <input id="agent-base-url" type="text" placeholder="http://localhost:9003">
+                </label>
+                <label>
+                  Superset Backend URL
+                  <input id="superset-base-url" type="text" value="http://localhost:9000">
+                </label>
+                <label class="wide">
+                  Superset Cookie
+                  <textarea id="superset-cookie" rows="2" placeholder="手动粘贴 Superset 页面请求里的 Cookie，例如 session=...; csrf_token=..."></textarea>
+                </label>
+              </div>
+              <p class="settings-note">
+                浏览器不能直接设置标准 Cookie 请求头。页面会把 Cookie 发给本地 Agent Service 调试代理，再由代理请求 Superset 后端。
+              </p>
+            </section>
 
             <div id="message-list" class="message-list" aria-live="polite">
               <article class="message assistant-message">
                 <div class="message-avatar">S</div>
                 <div class="message-content">
                   <strong>Superset Agent</strong>
-                  <p>可以查询仪表盘、图表、数据集和 SQL Lab。发送问题后，右侧会实时显示执行步骤。</p>
+                  <p>可以查询仪表盘、图表、数据集、SQL Lab，也可以结合知识库和长期语义记忆回答问题。</p>
                 </div>
               </article>
             </div>
@@ -92,21 +125,9 @@
                     时间范围
                     <input id="time-range" type="text" placeholder="例如 Last 7 days">
                   </label>
-                  <label>
+                  <label class="wide">
                     Filters JSON
                     <input id="filters" class="code-input" type="text" value="{}">
-                  </label>
-                  <label>
-                    User ID
-                    <input id="user-id" type="text" value="local-user">
-                  </label>
-                  <label>
-                    Tenant ID
-                    <input id="tenant-id" type="text" value="local">
-                  </label>
-                  <label>
-                    Roles
-                    <input id="roles" type="text" value="admin">
                   </label>
                 </div>
               </details>
@@ -114,7 +135,7 @@
               <div class="composer-footer">
                 <span id="composer-hint">Enter 发送，Shift+Enter 换行</span>
                 <button id="send-agent" class="send-button" type="submit" title="发送请求">
-                  <span aria-hidden="true">↑</span>
+                  <span aria-hidden="true">→</span>
                   <span>发送</span>
                 </button>
               </div>
@@ -165,7 +186,7 @@
         <header class="view-header compact">
           <div>
             <h1>MCP 工具</h1>
-            <p>检查工具 Schema，并在开发环境直接调用。</p>
+            <p>使用和对话相同的 Agent Token 请求方式读取工具并调试调用。</p>
           </div>
           <button id="load-tools" class="secondary-button" type="button">刷新工具</button>
         </header>
@@ -173,7 +194,7 @@
         <div class="tool-layout">
           <div class="tool-form">
             <label for="tool-name">工具名称</label>
-            <input id="tool-name" type="text" list="tool-options" placeholder="例如 health_check">
+            <input id="tool-name" type="text" list="tool-options" placeholder="例如 list_dashboards">
             <datalist id="tool-options"></datalist>
 
             <label for="tool-arguments">Arguments JSON</label>
@@ -186,6 +207,73 @@
               <strong id="tool-count">0 tools</strong>
             </div>
             <pre id="mcp-result">等待工具调用...</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="knowledge-view" class="app-view">
+        <header class="view-header compact">
+          <div>
+            <h1>知识库</h1>
+            <p>上传文件到 RAG，并测试按当前用户检索知识。</p>
+          </div>
+          <button id="load-documents" class="secondary-button" type="button">刷新文档</button>
+        </header>
+        <div class="tool-layout">
+          <div class="tool-form">
+            <label>
+              上传文件
+              <input id="knowledge-file" type="file">
+            </label>
+            <button id="upload-document" class="primary-button" type="button">上传并索引</button>
+            <label>
+              检索问题
+              <textarea id="knowledge-query" rows="5">这个项目的权限认证流程是什么？</textarea>
+            </label>
+            <button id="search-knowledge" class="primary-button" type="button">检索知识库</button>
+          </div>
+          <div class="tool-output">
+            <div class="output-heading">
+              <span>RAG Result</span>
+              <strong id="document-count">0 docs</strong>
+            </div>
+            <pre id="knowledge-result">等待操作...</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="memory-view" class="app-view">
+        <header class="view-header compact">
+          <div>
+            <h1>记忆</h1>
+            <p>查看结构化记忆接口；语义长期记忆在 Qdrant 集合 superset_agent_memory 中由 Runtime 自动写入。</p>
+          </div>
+          <button id="load-memories" class="secondary-button" type="button">刷新记忆</button>
+        </header>
+        <div class="tool-layout">
+          <div class="tool-form">
+            <label>
+              Memory Type
+              <input id="memory-type" type="text" placeholder="可选，例如 preference">
+            </label>
+            <label>
+              写入 JSON
+              <textarea id="memory-json" class="code-input" rows="12">{
+  "memory_type": "preference",
+  "memory_key": "chart_language",
+  "memory_value": {"value": "zh-CN"},
+  "source": "manual",
+  "confidence": 1.0
+}</textarea>
+            </label>
+            <button id="save-memory" class="primary-button" type="button">写入结构化记忆</button>
+          </div>
+          <div class="tool-output">
+            <div class="output-heading">
+              <span>Memory Result</span>
+              <strong id="memory-count">0 items</strong>
+            </div>
+            <pre id="memory-result">等待操作...</pre>
           </div>
         </div>
       </section>
@@ -245,6 +333,6 @@
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="/static/debug.js?v=20260617-1"></script>
+  <script src="/static/debug.js?v=20260622-3"></script>
 </body>
 </html>

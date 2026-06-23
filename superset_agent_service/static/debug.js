@@ -1,6 +1,8 @@
 "use strict";
 
-const STORAGE_KEY = "superset-agent-console-session-v1";
+const STORAGE_KEY = "superset-agent-console-session-v2";
+const CONFIG_KEY = "superset-agent-console-config-v1";
+const DEFAULT_SUPERSET_BASE_URL = "http://localhost:9000";
 
 const state = {
   socket: null,
@@ -13,6 +15,10 @@ const state = {
   activityEvents: [],
   runSummary: null,
   reconnectTimer: null,
+  reconnectEnabled: true,
+  socketConnectSeq: 0,
+  agentToken: null,
+  agentTokenExpiresAt: 0,
 };
 
 const elements = {
@@ -31,12 +37,24 @@ const elements = {
   summaryMessage: document.querySelector("#summary-message"),
   refreshSummary: document.querySelector("#refresh-summary"),
   clearChat: document.querySelector("#clear-chat"),
+  refreshToken: document.querySelector("#refresh-token"),
+  agentBaseUrl: document.querySelector("#agent-base-url"),
+  supersetBaseUrl: document.querySelector("#superset-base-url"),
+  supersetCookie: document.querySelector("#superset-cookie"),
   mcpResult: document.querySelector("#mcp-result"),
   mcpServerSummary: document.querySelector("#mcp-server-summary"),
   toolCount: document.querySelector("#tool-count"),
   toolName: document.querySelector("#tool-name"),
   toolArguments: document.querySelector("#tool-arguments"),
   toolOptions: document.querySelector("#tool-options"),
+  knowledgeFile: document.querySelector("#knowledge-file"),
+  knowledgeQuery: document.querySelector("#knowledge-query"),
+  knowledgeResult: document.querySelector("#knowledge-result"),
+  documentCount: document.querySelector("#document-count"),
+  memoryType: document.querySelector("#memory-type"),
+  memoryJson: document.querySelector("#memory-json"),
+  memoryResult: document.querySelector("#memory-result"),
+  memoryCount: document.querySelector("#memory-count"),
   traceRunId: document.querySelector("#trace-run-id"),
   traceTimeline: document.querySelector("#trace-timeline"),
   traceUser: document.querySelector("#trace-user"),
@@ -56,34 +74,168 @@ const activityLabels = {
   run_started: ["开始运行", "已接收请求并创建运行记录"],
   plan: ["分析问题", "正在整理问题和上下文"],
   tools_discovered: ["发现工具", "已读取当前身份可用的 MCP 工具"],
+  rag_retrieved: ["检索知识库", "已找到相关知识片段"],
+  rag_failed: ["知识库检索失败", "RAG 检索出现错误"],
+  memory_loaded: ["读取长期记忆", "已检索相似历史对话"],
+  memory_written: ["写入长期记忆", "本轮对话已写入语义记忆"],
+  memory_failed: ["记忆处理失败", "长期记忆读写出现错误"],
   tool_plan: ["规划工具", "模型已选择下一步工具"],
   tool_started: ["执行工具", "正在调用 Superset MCP"],
   tool_completed: ["工具完成", "MCP 已返回结果"],
   tool_failed: ["工具失败", "工具调用出现错误"],
+  tool_blocked: ["工具被拦截", "PolicyGuard 拦截了工具调用"],
+  sql_guard_rewritten: ["SQL 已改写", "SQLGuard 限制了查询范围"],
   answer_generated: ["生成回答", "模型已完成最终回答"],
   run_completed: ["运行完成", "本次 Agent 运行已结束"],
   run_failed: ["运行失败", "本次 Agent 运行未完成"],
 };
+
+function normalizeBaseUrl(value) {
+  return String(value || "").trim().replace(/\/$/, "");
+}
+
+function getAgentBaseUrl() {
+  const configured = normalizeBaseUrl(elements.agentBaseUrl.value);
+  return configured || window.location.origin;
+}
+
+function getSupersetBaseUrl() {
+  return normalizeBaseUrl(elements.supersetBaseUrl.value) || DEFAULT_SUPERSET_BASE_URL;
+}
+
+function buildHttpUrl(baseUrl, path, agentToken) {
+  const url = new URL(`${normalizeBaseUrl(baseUrl)}${path}`, window.location.origin);
+  if (agentToken) {
+    url.searchParams.set("agent_token", agentToken);
+  }
+  return url.toString();
+}
+
+function buildWebSocketUrl(baseUrl, path, agentToken) {
+  const parsed = new URL(`${normalizeBaseUrl(baseUrl)}${path}`, window.location.origin);
+  parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+  if (agentToken) {
+    parsed.searchParams.set("agent_token", agentToken);
+  }
+  return parsed.toString();
+}
+
+function extractAgentToken(payload) {
+  return (
+    payload?.token ||
+    payload?.access_token ||
+    payload?.result?.token ||
+    payload?.result?.access_token ||
+    ""
+  );
+}
+
+async function getAgentToken(forceRefresh = false) {
+  if (
+    !forceRefresh &&
+    state.agentToken &&
+    state.agentTokenExpiresAt > Date.now()
+  ) {
+    return state.agentToken;
+  }
+
+  setConnectionState("token", false, "Token 获取中");
+  const response = await fetch(
+    buildHttpUrl(getAgentBaseUrl(), "/api/v1/agents/dev/superset-token"),
+    {
+    method: "POST",
+    credentials: "include",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        superset_base_url: getSupersetBaseUrl(),
+        cookie: elements.supersetCookie.value.trim(),
+      }),
+    },
+  );
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json")
+    ? await response.json()
+    : await response.text();
+  if (!response.ok) {
+    const detail =
+      typeof payload === "object" && payload !== null && "detail" in payload
+        ? payload.detail
+        : payload || `HTTP ${response.status}`;
+    setConnectionState("token", false, "Token 获取失败");
+    throw new Error(String(detail));
+  }
+
+  const token = extractAgentToken(payload);
+  if (!token) {
+    setConnectionState("token", false, "Token 响应无效");
+    throw new Error("Superset token response does not include token");
+  }
+  const expiresIn = payload?.expires_in || payload?.result?.expires_in || 300;
+  state.agentToken = token;
+  state.agentTokenExpiresAt = Date.now() + Math.max(0, Number(expiresIn) * 1000 - 30000);
+  setConnectionState("token", true, "Token 已获取");
+  persistConfig();
+  return token;
+}
+
+function addAgentTokenToBody(body, token) {
+  if (typeof body !== "string") {
+    return body;
+  }
+  try {
+    const payload = JSON.parse(body);
+    return JSON.stringify({
+      ...payload,
+      agent_token: token,
+      token,
+    });
+  } catch {
+    return body;
+  }
+}
+
+async function agentFetch(path, options = {}) {
+  const agentToken = await getAgentToken();
+  const body = addAgentTokenToBody(options.body, agentToken);
+  const headers = {
+    ...(body instanceof FormData ? {} : body ? {"Content-Type": "application/json"} : {}),
+    Authorization: `Bearer ${agentToken}`,
+    "X-Superset-Agent-Token": agentToken,
+    ...(options.headers || {}),
+  };
+  const response = await fetch(buildHttpUrl(getAgentBaseUrl(), path, agentToken), {
+    credentials: "include",
+    ...options,
+    body,
+    headers,
+  });
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json")
+    ? await response.json()
+    : await response.text();
+  if (!response.ok) {
+    const detail =
+      typeof payload === "object" && payload !== null && "detail" in payload
+        ? payload.detail
+        : payload || `HTTP ${response.status}`;
+    throw new Error(String(detail));
+  }
+  return payload;
+}
 
 function pretty(value) {
   return JSON.stringify(value, null, 2);
 }
 
 function formatDuration(milliseconds) {
-  if (!Number.isFinite(milliseconds)) {
-    return "未记录";
-  }
-  if (milliseconds < 1000) {
-    return `${milliseconds} ms`;
-  }
+  if (!Number.isFinite(milliseconds)) return "未记录";
+  if (milliseconds < 1000) return `${milliseconds} ms`;
   return `${(milliseconds / 1000).toFixed(2)} s`;
 }
 
 function formatTokens(trace) {
   const total = trace?.total_tokens;
-  if (!Number.isFinite(total)) {
-    return "未返回";
-  }
+  if (!Number.isFinite(total)) return "未返回";
   const input = Number.isFinite(trace.input_tokens) ? trace.input_tokens : 0;
   const output = Number.isFinite(trace.output_tokens) ? trace.output_tokens : 0;
   return `${total} total | ${input} in / ${output} out`;
@@ -94,9 +246,7 @@ function formatDateTime(value) {
 }
 
 function formatSummaryText(value, maxLength = 220) {
-  if (!value) {
-    return "";
-  }
+  if (!value) return "";
   const text = String(value).replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
@@ -108,10 +258,8 @@ function renderLiveSummary(trace, message = "") {
   elements.summaryStatus.dataset.status = status;
   elements.summaryDuration.textContent = formatDuration(trace?.duration_ms);
   elements.summaryTokens.textContent = formatTokens(trace);
-  elements.summaryError.textContent =
-    formatSummaryText(trace?.error_message, 80) || "无";
-  elements.summaryMessage.textContent =
-    message || summaryMessageForTrace(trace);
+  elements.summaryError.textContent = formatSummaryText(trace?.error_message, 80) || "无";
+  elements.summaryMessage.textContent = message || summaryMessageForTrace(trace);
 }
 
 function renderTraceSummary(trace) {
@@ -125,15 +273,9 @@ function renderTraceSummary(trace) {
 }
 
 function summaryMessageForTrace(trace) {
-  if (!trace) {
-    return "发送请求后自动加载运行摘要。";
-  }
-  if (trace.error_message) {
-    return "运行失败，错误详情已保存到 Run Trace。";
-  }
-  if (trace.status === "completed") {
-    return "运行摘要已从持久化 Run Trace 加载。";
-  }
+  if (!trace) return "发送请求后自动加载运行摘要。";
+  if (trace.error_message) return "运行失败，错误详情已保存到 Run Trace。";
+  if (trace.status === "completed") return "运行摘要已从持久化 Run Trace 加载。";
   if (trace.status === "running" || trace.status === "created") {
     return "运行中，完成后会自动刷新摘要。";
   }
@@ -147,21 +289,16 @@ async function refreshRunSummary(runId, showErrors = false) {
   }
   renderLiveSummary(state.runSummary || {status: "loading"}, "正在读取运行摘要...");
   try {
-    const trace = await apiFetch(`/api/v1/runs/${encodeURIComponent(runId)}`);
+    const trace = await agentFetch(`/api/v1/runs/${encodeURIComponent(runId)}`);
     renderLiveSummary(trace);
     persistSession();
     return trace;
   } catch (error) {
     renderLiveSummary(
-      {
-        status: "summary_error",
-        error_message: error.message,
-      },
-      "摘要加载失败。请确认数据库已执行 alembic upgrade head，并且当前服务使用同一个 DATABASE_URL。",
+      {status: "summary_error", error_message: error.message},
+      "摘要加载失败。请确认数据库已执行 alembic upgrade head，并且服务使用同一个 DATABASE_URL。",
     );
-    if (showErrors) {
-      showToast(error.message, true);
-    }
+    if (showErrors) showToast(error.message, true);
     return null;
   }
 }
@@ -172,19 +309,6 @@ function parseJsonInput(element, label) {
   } catch (error) {
     throw new Error(`${label} 不是合法 JSON：${error.message}`);
   }
-}
-
-async function apiFetch(path, options = {}) {
-  const response = await fetch(path, options);
-  const contentType = response.headers.get("content-type") || "";
-  const body = contentType.includes("application/json")
-    ? await response.json()
-    : await response.text();
-  if (!response.ok) {
-    const detail = typeof body === "object" ? body.detail : body;
-    throw new Error(detail || `HTTP ${response.status}`);
-  }
-  return body;
 }
 
 function showToast(message, isError = false) {
@@ -200,6 +324,7 @@ function showToast(message, isError = false) {
 function setConnectionState(kind, online, text) {
   const dot = document.querySelector(`#${kind}-status`);
   const label = document.querySelector(`#${kind}-status-text`);
+  if (!dot || !label) return;
   dot.classList.toggle("online", online);
   dot.classList.toggle("offline", !online);
   label.textContent = text;
@@ -214,41 +339,69 @@ function activateView(viewId) {
   });
 }
 
-function connectSocket() {
+async function connectSocket(forceRefreshToken = false) {
   window.clearTimeout(state.reconnectTimer);
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  if (
+    !forceRefreshToken &&
+    state.socket &&
+    [WebSocket.CONNECTING, WebSocket.OPEN].includes(state.socket.readyState)
+  ) {
+    return;
+  }
+
+  const connectSeq = state.socketConnectSeq + 1;
+  state.socketConnectSeq = connectSeq;
+  const previousSocket = state.socket;
+  if (previousSocket && previousSocket.readyState !== WebSocket.CLOSED) {
+    previousSocket.close(1000, "Replacing WebSocket connection");
+  }
+
+  let agentToken = "";
+  try {
+    agentToken = await getAgentToken(forceRefreshToken);
+  } catch (error) {
+    setConnectionState("socket", false, "实时通道 token 获取失败");
+    showToast(error.message, true);
+    state.reconnectTimer = window.setTimeout(() => connectSocket(false), 3000);
+    return;
+  }
+
   const socket = new WebSocket(
-    `${protocol}//${window.location.host}/api/v1/agents/ws`,
+    buildWebSocketUrl(getAgentBaseUrl(), "/api/v1/agents/ws", agentToken),
   );
   state.socket = socket;
 
   socket.addEventListener("open", () => {
+    if (connectSeq !== state.socketConnectSeq) return;
     state.socketReady = true;
     setConnectionState("socket", true, "实时通道在线");
   });
 
   socket.addEventListener("message", (event) => {
+    if (connectSeq !== state.socketConnectSeq) return;
     handleSocketMessage(JSON.parse(event.data));
   });
 
   socket.addEventListener("close", () => {
+    if (connectSeq !== state.socketConnectSeq) return;
     state.socketReady = false;
     setConnectionState("socket", false, "实时通道重连中");
     if (state.running) {
-      failRun("实时连接已中断，请在连接恢复后重新发送");
+      failRun("实时连接已中断，请在连接恢复后重新发送。");
     }
-    state.reconnectTimer = window.setTimeout(connectSocket, 1500);
+    if (state.reconnectEnabled) {
+      state.reconnectTimer = window.setTimeout(() => connectSocket(false), 1500);
+    }
   });
 
   socket.addEventListener("error", () => {
+    if (connectSeq !== state.socketConnectSeq) return;
     setConnectionState("socket", false, "实时通道异常");
   });
 }
 
 function handleSocketMessage(message) {
-  if (message.type === "connected") {
-    return;
-  }
+  if (message.type === "connected" || message.type === "authenticated") return;
   if (message.run_id) {
     state.currentRunId = message.run_id;
     elements.activityRunId.textContent = message.run_id;
@@ -257,10 +410,7 @@ function handleSocketMessage(message) {
 
   if (message.type === "run_event") {
     addActivity(message.event);
-    if (
-      ["run_completed", "run_failed"].includes(message.event?.event_type) &&
-      message.run_id
-    ) {
+    if (["run_completed", "run_failed"].includes(message.event?.event_type) && message.run_id) {
       window.setTimeout(() => refreshRunSummary(message.run_id, true), 350);
     }
     return;
@@ -278,24 +428,18 @@ function handleSocketMessage(message) {
   }
 }
 
-function buildRequest() {
+function buildRequest(agentToken) {
   return {
     type: "run",
+    token: agentToken,
+    agent_token: agentToken,
+    access_token: agentToken,
     request: {
       question: elements.question.value.trim(),
       dashboard_id: document.querySelector("#dashboard-id").value.trim() || null,
       chart_id: document.querySelector("#chart-id").value.trim() || null,
       time_range: document.querySelector("#time-range").value.trim() || null,
       filters: parseJsonInput(document.querySelector("#filters"), "Filters"),
-    },
-    context: {
-      user_id: document.querySelector("#user-id").value.trim() || "local-user",
-      tenant_id: document.querySelector("#tenant-id").value.trim() || null,
-      roles: document
-        .querySelector("#roles")
-        .value.split(",")
-        .map((role) => role.trim())
-        .filter(Boolean),
     },
   };
 }
@@ -371,8 +515,6 @@ function finishRun(response) {
 
   if (state.currentAnswer) {
     state.currentAnswer.classList.remove("streaming");
-    // The final response is authoritative. It also fills the answer if a
-    // provider returned no token chunks before completing.
     state.currentAnswer.dataset.raw = response.answer;
     renderMarkdown(state.currentAnswer, response.answer);
   }
@@ -392,10 +534,10 @@ function failRun(error) {
     state.currentAnswer.textContent = message;
     state.currentAnswer.dataset.raw = message;
   }
-  renderLiveSummary({
-    status: "failed",
-    error_message: error,
-  }, "运行失败，摘要会在 Run Trace 写入后自动刷新。");
+  renderLiveSummary(
+    {status: "failed", error_message: error},
+    "运行失败，摘要会在 Run Trace 写入后自动刷新。",
+  );
   persistSession();
   showToast(error, true);
 }
@@ -407,9 +549,9 @@ function addActivity(event, shouldPersist = true) {
   const item = document.createElement("li");
   item.className = "activity-item";
 
-  if (eventType === "run_failed" || eventType === "tool_failed") {
+  if (eventType.endsWith("_failed") || eventType === "tool_blocked") {
     item.classList.add("failed");
-  } else if (eventType === "run_completed" || eventType === "tool_completed") {
+  } else if (eventType.endsWith("_completed") || eventType === "memory_written") {
     item.classList.add("done");
   } else {
     item.classList.add("active");
@@ -430,32 +572,21 @@ function addActivity(event, shouldPersist = true) {
   elements.activityList.append(item);
 
   state.activityCount += 1;
-  if (shouldPersist) {
-    state.activityEvents.push(event);
-  }
+  if (shouldPersist) state.activityEvents.push(event);
   elements.activityCount.textContent = `${state.activityCount} 步`;
   elements.activityList.scrollTop = elements.activityList.scrollHeight;
-  if (shouldPersist) {
-    persistSession();
-  }
+  if (shouldPersist) persistSession();
 }
 
 function activityDetail(eventType, payload, fallback) {
-  if (eventType === "tools_discovered") {
-    return `发现 ${payload.count || 0} 个可用工具`;
-  }
-  if (eventType === "tool_plan") {
-    return `计划调用：${(payload.tools || []).join(", ") || "未知工具"}`;
-  }
-  if (eventType === "tool_started") {
-    return `${payload.tool || "工具"} ${pretty(payload.arguments || {})}`;
-  }
-  if (eventType === "tool_completed") {
-    return `${payload.tool || "工具"} 已返回结果`;
-  }
-  if (payload.error) {
-    return payload.error;
-  }
+  if (eventType === "tools_discovered") return `发现 ${payload.count || 0} 个可用工具`;
+  if (eventType === "rag_retrieved") return `命中 ${payload.count || 0} 条知识`;
+  if (eventType === "memory_loaded") return `命中 ${payload.semantic_conversation_count || 0} 条历史对话`;
+  if (eventType === "memory_written") return `写入 ${payload.memory_type || "memory"}`;
+  if (eventType === "tool_plan") return `计划调用：${(payload.tools || []).join(", ") || "未知工具"}`;
+  if (eventType === "tool_started") return `${payload.tool || "工具"} ${pretty(payload.arguments || {})}`;
+  if (eventType === "tool_completed") return `${payload.tool || "工具"} 已返回结果`;
+  if (payload.error) return payload.error;
   return fallback;
 }
 
@@ -464,23 +595,16 @@ function scrollConversation() {
 }
 
 function renderMarkdown(container, markdown) {
-  /*
-   * Model output is untrusted. This renderer creates DOM nodes and text nodes
-   * directly instead of assigning innerHTML, so Markdown-like HTML cannot run
-   * scripts or inject event handlers into the development console.
-   */
   const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
   const fragment = document.createDocumentFragment();
   let index = 0;
 
   while (index < lines.length) {
     const line = lines[index];
-
     if (!line.trim()) {
       index += 1;
       continue;
     }
-
     if (line.startsWith("```")) {
       const language = line.slice(3).trim();
       const codeLines = [];
@@ -492,15 +616,12 @@ function renderMarkdown(container, markdown) {
       index += index < lines.length ? 1 : 0;
       const pre = document.createElement("pre");
       const code = document.createElement("code");
-      if (language) {
-        code.dataset.language = language;
-      }
+      if (language) code.dataset.language = language;
       code.textContent = codeLines.join("\n");
       pre.append(code);
       fragment.append(pre);
       continue;
     }
-
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
       const element = document.createElement(`h${heading[1].length}`);
@@ -509,12 +630,7 @@ function renderMarkdown(container, markdown) {
       index += 1;
       continue;
     }
-
-    if (
-      line.includes("|") &&
-      index + 1 < lines.length &&
-      isTableSeparator(lines[index + 1])
-    ) {
+    if (line.includes("|") && index + 1 < lines.length && isTableSeparator(lines[index + 1])) {
       const tableLines = [line];
       index += 2;
       while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
@@ -524,7 +640,6 @@ function renderMarkdown(container, markdown) {
       fragment.append(buildMarkdownTable(tableLines));
       continue;
     }
-
     if (/^[-*+]\s+/.test(line)) {
       const list = document.createElement("ul");
       while (index < lines.length && /^[-*+]\s+/.test(lines[index])) {
@@ -536,7 +651,6 @@ function renderMarkdown(container, markdown) {
       fragment.append(list);
       continue;
     }
-
     if (/^\d+\.\s+/.test(line)) {
       const list = document.createElement("ol");
       while (index < lines.length && /^\d+\.\s+/.test(lines[index])) {
@@ -548,32 +662,9 @@ function renderMarkdown(container, markdown) {
       fragment.append(list);
       continue;
     }
-
-    if (/^>\s?/.test(line)) {
-      const quote = document.createElement("blockquote");
-      const quoteLines = [];
-      while (index < lines.length && /^>\s?/.test(lines[index])) {
-        quoteLines.push(lines[index].replace(/^>\s?/, ""));
-        index += 1;
-      }
-      appendInlineMarkdown(quote, quoteLines.join("\n"));
-      fragment.append(quote);
-      continue;
-    }
-
-    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
-      fragment.append(document.createElement("hr"));
-      index += 1;
-      continue;
-    }
-
     const paragraphLines = [line];
     index += 1;
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !startsMarkdownBlock(lines, index)
-    ) {
+    while (index < lines.length && lines[index].trim() && !startsMarkdownBlock(lines, index)) {
       paragraphLines.push(lines[index]);
       index += 1;
     }
@@ -581,7 +672,6 @@ function renderMarkdown(container, markdown) {
     appendInlineMarkdown(paragraph, paragraphLines.join("\n"));
     fragment.append(paragraph);
   }
-
   container.replaceChildren(fragment);
   container.classList.add("markdown-body");
 }
@@ -593,11 +683,7 @@ function startsMarkdownBlock(lines, index) {
     /^(#{1,6})\s+/.test(line) ||
     /^[-*+]\s+/.test(line) ||
     /^\d+\.\s+/.test(line) ||
-    /^>\s?/.test(line) ||
-    /^(-{3,}|\*{3,}|_{3,})$/.test(line.trim()) ||
-    (line.includes("|") &&
-      index + 1 < lines.length &&
-      isTableSeparator(lines[index + 1]))
+    (line.includes("|") && index + 1 < lines.length && isTableSeparator(lines[index + 1]))
   );
 }
 
@@ -607,12 +693,7 @@ function isTableSeparator(line) {
 }
 
 function splitTableRow(line) {
-  return line
-    .trim()
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.trim());
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
 }
 
 function buildMarkdownTable(lines) {
@@ -620,14 +701,12 @@ function buildMarkdownTable(lines) {
   const thead = document.createElement("thead");
   const tbody = document.createElement("tbody");
   const headerRow = document.createElement("tr");
-
   splitTableRow(lines[0]).forEach((cell) => {
     const header = document.createElement("th");
     appendInlineMarkdown(header, cell);
     headerRow.append(header);
   });
   thead.append(headerRow);
-
   lines.slice(1).forEach((line) => {
     const row = document.createElement("tr");
     splitTableRow(line).forEach((cell) => {
@@ -637,7 +716,6 @@ function buildMarkdownTable(lines) {
     });
     tbody.append(row);
   });
-
   table.append(thead, tbody);
   const wrapper = document.createElement("div");
   wrapper.className = "markdown-table-wrap";
@@ -649,11 +727,9 @@ function appendInlineMarkdown(parent, text) {
   const tokenPattern =
     /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^\]\n]+\]\([^) \n]+\))/g;
   let cursor = 0;
-
   for (const match of text.matchAll(tokenPattern)) {
     appendTextWithBreaks(parent, text.slice(cursor, match.index));
     const token = match[0];
-
     if (token.startsWith("`")) {
       const code = document.createElement("code");
       code.textContent = token.slice(1, -1);
@@ -667,7 +743,7 @@ function appendInlineMarkdown(parent, text) {
       emphasis.textContent = token.slice(1, -1);
       parent.append(emphasis);
     } else if (token.startsWith("[")) {
-      const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      const linkMatch = token.match(/^\[([^\]]+)\]\(([^) \n]+)\)$/);
       if (linkMatch && /^https?:\/\//i.test(linkMatch[2])) {
         const link = document.createElement("a");
         link.textContent = linkMatch[1];
@@ -686,11 +762,36 @@ function appendInlineMarkdown(parent, text) {
 
 function appendTextWithBreaks(parent, text) {
   text.split("\n").forEach((part, index) => {
-    if (index > 0) {
-      parent.append(document.createElement("br"));
-    }
+    if (index > 0) parent.append(document.createElement("br"));
     parent.append(document.createTextNode(part));
   });
+}
+
+function persistConfig() {
+  try {
+    localStorage.setItem(
+      CONFIG_KEY,
+      JSON.stringify({
+        agentBaseUrl: elements.agentBaseUrl.value,
+        supersetBaseUrl: elements.supersetBaseUrl.value,
+        supersetCookie: elements.supersetCookie.value,
+      }),
+    );
+  } catch (error) {
+    console.warn("Unable to persist Agent config", error);
+  }
+}
+
+function restoreConfig() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CONFIG_KEY) || "null");
+    elements.agentBaseUrl.value = saved?.agentBaseUrl || window.location.origin;
+    elements.supersetBaseUrl.value = saved?.supersetBaseUrl || DEFAULT_SUPERSET_BASE_URL;
+    elements.supersetCookie.value = saved?.supersetCookie || "";
+  } catch {
+    elements.agentBaseUrl.value = window.location.origin;
+    elements.supersetBaseUrl.value = DEFAULT_SUPERSET_BASE_URL;
+  }
 }
 
 function persistSession() {
@@ -704,7 +805,6 @@ function persistSession() {
         content: answer?.dataset.raw || answer?.textContent || "",
       };
     });
-
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
@@ -733,45 +833,27 @@ function restoreSession() {
     console.warn("Unable to restore Agent session", error);
     return;
   }
-  if (!saved || !Array.isArray(saved.messages)) {
-    return;
-  }
-
+  if (!saved || !Array.isArray(saved.messages)) return;
   saved.messages.forEach((message) => {
-    if (!message || !["user", "assistant"].includes(message.role)) {
-      return;
-    }
+    if (!message || !["user", "assistant"].includes(message.role)) return;
     const answer = addMessage(message.role, message.content || "");
-    if (message.role === "assistant") {
-      renderMarkdown(answer, message.content || "");
-    }
+    if (message.role === "assistant") renderMarkdown(answer, message.content || "");
   });
-
   state.currentRunId = saved.runId || null;
   if (state.currentRunId) {
     elements.activityRunId.textContent = state.currentRunId;
     elements.traceRunId.value = state.currentRunId;
   }
-
-  state.activityEvents = Array.isArray(saved.activityEvents)
-    ? saved.activityEvents
-    : [];
+  state.activityEvents = Array.isArray(saved.activityEvents) ? saved.activityEvents : [];
   if (state.activityEvents.length) {
     elements.activityList.replaceChildren();
     state.activityCount = 0;
     state.activityEvents.forEach((event) => addActivity(event, false));
   }
-
-  if (saved.runState && saved.runState !== "运行中") {
-    elements.runState.textContent = saved.runState;
-  }
-  if (saved.runSummary) {
-    renderLiveSummary(saved.runSummary);
-  } else if (state.currentRunId) {
-    refreshRunSummary(state.currentRunId, false);
-  } else {
-    renderLiveSummary(null);
-  }
+  if (saved.runState && saved.runState !== "运行中") elements.runState.textContent = saved.runState;
+  if (saved.runSummary) renderLiveSummary(saved.runSummary);
+  else if (state.currentRunId) refreshRunSummary(state.currentRunId, false);
+  else renderLiveSummary(null);
   scrollConversation();
 }
 
@@ -786,8 +868,7 @@ function clearConversation() {
   state.runSummary = null;
   elements.activityRunId.textContent = "等待运行";
   elements.activityCount.textContent = "0 步";
-  elements.activityList.innerHTML =
-    '<li class="activity-empty">发送请求后，执行步骤会实时显示在这里。</li>';
+  elements.activityList.innerHTML = '<li class="activity-empty">发送请求后，执行步骤会实时显示在这里。</li>';
   elements.traceRunId.value = "";
   renderLiveSummary(null);
   renderTraceSummary(null);
@@ -799,17 +880,14 @@ function clearConversation() {
 
 async function submitAgent(event) {
   event.preventDefault();
-  if (state.running) {
-    return;
-  }
+  if (state.running) return;
   try {
     if (!state.socketReady || state.socket.readyState !== WebSocket.OPEN) {
       throw new Error("实时通道尚未连接，请稍后重试");
     }
-    const message = buildRequest();
-    if (!message.request.question) {
-      throw new Error("请输入问题");
-    }
+    const agentToken = await getAgentToken();
+    const message = buildRequest(agentToken);
+    if (!message.request.question) throw new Error("请输入问题");
     startRun(message.request.question);
     state.socket.send(JSON.stringify(message));
   } catch (error) {
@@ -818,17 +896,16 @@ async function submitAgent(event) {
 }
 
 async function refreshStatus() {
+  persistConfig();
   const [agentCheck, mcpCheck] = await Promise.allSettled([
-    apiFetch("/api/v1/health"),
-    apiFetch("/api/v1/mcp/status"),
+    agentFetch("/api/v1/health"),
+    agentFetch("/api/v1/mcp/status"),
   ]);
-
   setConnectionState(
     "agent",
     agentCheck.status === "fulfilled",
     agentCheck.status === "fulfilled" ? "Agent 在线" : "Agent 离线",
   );
-
   if (mcpCheck.status === "fulfilled") {
     const status = mcpCheck.value;
     setConnectionState("mcp", true, `MCP 在线 · ${status.tool_count} tools`);
@@ -838,18 +915,18 @@ async function refreshStatus() {
     elements.toolCount.textContent = `${status.tool_count} tools`;
   } else {
     setConnectionState("mcp", false, "MCP 离线");
-    elements.mcpServerSummary.textContent = mcpCheck.reason.message;
+    elements.mcpServerSummary.textContent = mcpCheck.reason?.message || "MCP 状态读取失败";
   }
 }
 
 async function loadTools() {
   try {
     elements.mcpResult.textContent = "正在读取工具列表...";
-    const response = await apiFetch("/api/v1/mcp/tools");
-    state.tools = response.tools;
-    elements.toolCount.textContent = `${response.tools.length} tools`;
+    const response = await agentFetch("/api/v1/mcp/tools");
+    state.tools = response.tools || [];
+    elements.toolCount.textContent = `${state.tools.length} tools`;
     elements.toolOptions.replaceChildren(
-      ...response.tools.map((tool) => {
+      ...state.tools.map((tool) => {
         const option = document.createElement("option");
         option.value = tool.name;
         option.label = tool.description;
@@ -865,27 +942,97 @@ async function loadTools() {
 
 function showSelectedToolSchema() {
   const tool = state.tools.find((item) => item.name === elements.toolName.value);
-  if (tool) {
-    elements.mcpResult.textContent = pretty(tool);
-  }
+  if (tool) elements.mcpResult.textContent = pretty(tool);
 }
 
 async function callTool() {
   try {
     const name = elements.toolName.value.trim();
-    if (!name) {
-      throw new Error("请输入 MCP 工具名称");
-    }
+    if (!name) throw new Error("请输入 MCP 工具名称");
     const argumentsValue = parseJsonInput(elements.toolArguments, "Arguments");
     elements.mcpResult.textContent = "工具调用中...";
-    const response = await apiFetch("/api/v1/mcp/call", {
+    const response = await agentFetch("/api/v1/mcp/call", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
       body: JSON.stringify({name, arguments: argumentsValue}),
     });
     elements.mcpResult.textContent = pretty(response);
   } catch (error) {
     elements.mcpResult.textContent = error.message;
+    showToast(error.message, true);
+  }
+}
+
+async function uploadDocument() {
+  try {
+    const file = elements.knowledgeFile.files?.[0];
+    if (!file) throw new Error("请选择要上传的文件");
+    const formData = new FormData();
+    formData.append("file", file);
+    elements.knowledgeResult.textContent = "上传并索引中...";
+    const response = await agentFetch("/api/v1/rag/documents", {
+      method: "POST",
+      body: formData,
+    });
+    elements.knowledgeResult.textContent = pretty(response);
+    await loadDocuments();
+  } catch (error) {
+    elements.knowledgeResult.textContent = error.message;
+    showToast(error.message, true);
+  }
+}
+
+async function loadDocuments() {
+  try {
+    const response = await agentFetch("/api/v1/rag/documents");
+    elements.documentCount.textContent = `${response.length || 0} docs`;
+    elements.knowledgeResult.textContent = pretty(response);
+  } catch (error) {
+    elements.knowledgeResult.textContent = error.message;
+    showToast(error.message, true);
+  }
+}
+
+async function searchKnowledge() {
+  try {
+    const query = elements.knowledgeQuery.value.trim();
+    if (!query) throw new Error("请输入检索问题");
+    const response = await agentFetch("/api/v1/rag/search", {
+      method: "POST",
+      body: JSON.stringify({query, limit: 5}),
+    });
+    elements.knowledgeResult.textContent = pretty(response);
+  } catch (error) {
+    elements.knowledgeResult.textContent = error.message;
+    showToast(error.message, true);
+  }
+}
+
+async function loadMemories() {
+  try {
+    const type = elements.memoryType.value.trim();
+    const path = type
+      ? `/api/v1/memories?memory_type=${encodeURIComponent(type)}`
+      : "/api/v1/memories";
+    const response = await agentFetch(path);
+    elements.memoryCount.textContent = `${response.memories?.length || 0} items`;
+    elements.memoryResult.textContent = pretty(response);
+  } catch (error) {
+    elements.memoryResult.textContent = error.message;
+    showToast(error.message, true);
+  }
+}
+
+async function saveMemory() {
+  try {
+    const payload = parseJsonInput(elements.memoryJson, "Memory JSON");
+    const response = await agentFetch("/api/v1/memories", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    elements.memoryResult.textContent = pretty(response);
+    await loadMemories();
+  } catch (error) {
+    elements.memoryResult.textContent = error.message;
     showToast(error.message, true);
   }
 }
@@ -897,7 +1044,7 @@ async function loadTrace() {
     return;
   }
   try {
-    const trace = await apiFetch(`/api/v1/runs/${encodeURIComponent(runId)}`);
+    const trace = await agentFetch(`/api/v1/runs/${encodeURIComponent(runId)}`);
     elements.traceUser.textContent = trace.user_id;
     elements.traceStatus.textContent = trace.status;
     elements.traceCount.textContent = trace.events.length;
@@ -925,26 +1072,51 @@ async function loadTrace() {
   }
 }
 
-document.querySelectorAll(".nav-button").forEach((button) => {
-  button.addEventListener("click", () => activateView(button.dataset.view));
-});
-document.querySelector("#refresh-status").addEventListener("click", refreshStatus);
-document.querySelector("#load-tools").addEventListener("click", loadTools);
-document.querySelector("#call-tool").addEventListener("click", callTool);
-document.querySelector("#load-trace").addEventListener("click", loadTrace);
-elements.refreshSummary.addEventListener("click", () => {
-  refreshRunSummary(state.currentRunId || elements.traceRunId.value.trim(), true);
-});
-elements.clearChat.addEventListener("click", clearConversation);
-elements.toolName.addEventListener("change", showSelectedToolSchema);
-elements.agentForm.addEventListener("submit", submitAgent);
-elements.question.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    elements.agentForm.requestSubmit();
-  }
-});
+function bindEvents() {
+  document.querySelectorAll(".nav-button").forEach((button) => {
+    button.addEventListener("click", () => activateView(button.dataset.view));
+  });
+  document.querySelector("#refresh-status").addEventListener("click", refreshStatus);
+  elements.refreshToken.addEventListener("click", async () => {
+    try {
+      await getAgentToken(true);
+      await connectSocket(true);
+      showToast("Token 已刷新");
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  });
+  document.querySelector("#load-tools").addEventListener("click", loadTools);
+  document.querySelector("#call-tool").addEventListener("click", callTool);
+  document.querySelector("#upload-document").addEventListener("click", uploadDocument);
+  document.querySelector("#load-documents").addEventListener("click", loadDocuments);
+  document.querySelector("#search-knowledge").addEventListener("click", searchKnowledge);
+  document.querySelector("#load-memories").addEventListener("click", loadMemories);
+  document.querySelector("#save-memory").addEventListener("click", saveMemory);
+  document.querySelector("#load-trace").addEventListener("click", loadTrace);
+  elements.refreshSummary.addEventListener("click", () => {
+    refreshRunSummary(state.currentRunId || elements.traceRunId.value.trim(), true);
+  });
+  elements.clearChat.addEventListener("click", clearConversation);
+  elements.toolName.addEventListener("change", showSelectedToolSchema);
+  elements.agentForm.addEventListener("submit", submitAgent);
+  elements.question.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      elements.agentForm.requestSubmit();
+    }
+  });
+  [elements.agentBaseUrl, elements.supersetBaseUrl, elements.supersetCookie].forEach((element) => {
+    element.addEventListener("change", () => {
+      state.agentToken = null;
+      persistConfig();
+      connectSocket(true);
+    });
+  });
+}
 
+restoreConfig();
 restoreSession();
+bindEvents();
 connectSocket();
 refreshStatus();

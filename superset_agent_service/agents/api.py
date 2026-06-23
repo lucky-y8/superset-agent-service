@@ -3,13 +3,15 @@
 Agent 执行所使用的 HTTP 与 WebSocket 接口。
 """
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from superset_agent_service.agents.schemas import (
     AgentRequest,
     AgentResponse,
     AgentSocketRequest,
+    SupersetTokenProxyRequest,
 )
 from superset_agent_service.agents.service import AgentService
 from superset_agent_service.auth.dependencies import get_permission_context
@@ -21,6 +23,58 @@ from superset_agent_service.auth.superset_token import (
 from superset_agent_service.config import settings
 
 router = APIRouter()
+
+
+@router.post("/dev/superset-token")
+async def proxy_superset_agent_token(
+    request: SupersetTokenProxyRequest,
+) -> dict[str, object]:
+    """Proxy a debug-page token request to Superset with a real Cookie header.
+
+    将调试页的 Token 请求代理到 Superset，并使用真正的 Cookie 请求头。
+
+    Browser JavaScript cannot set the standard ``Cookie`` header.  The local
+    debug page therefore posts the pasted cookie to this endpoint, and this
+    server-side proxy forwards it to Superset.  Keep this endpoint for local
+    development only; integrated Superset pages should call Superset directly.
+
+    浏览器 JavaScript 不能设置标准 ``Cookie`` 请求头。因此本地调试页会把手动粘贴的
+    Cookie 发到这里，再由服务端代理转发给 Superset。该接口仅用于本地开发；真正集成到
+    Superset 的页面应直接调用 Superset 后端接口。
+    """
+
+    base_url = request.superset_base_url.strip().rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="superset_base_url is required.")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Referer": base_url,
+        "Origin": base_url,
+    }
+    if request.cookie.strip():
+        headers["Cookie"] = request.cookie.strip()
+        csrf_token = _csrf_from_cookie(request.cookie)
+        if csrf_token:
+            headers["X-CSRFToken"] = csrf_token
+
+    url = f"{base_url}/api/v1/agent/token"
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        response = await client.post(url, json={}, headers=headers)
+    content_type = response.headers.get("content-type", "")
+    body: object
+    if "application/json" in content_type:
+        body = response.json()
+    else:
+        body = response.text
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=body,
+        )
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="Superset returned non-JSON token response.")
+    return body
 
 
 @router.post("/chat", response_model=AgentResponse)
@@ -207,5 +261,18 @@ def _token_from_query(websocket: WebSocket) -> str | None:
     for key in ("token", "agent_token", "access_token"):
         value = websocket.query_params.get(key)
         if value:
+            return value
+    return None
+
+
+def _csrf_from_cookie(cookie: str) -> str | None:
+    """Extract a likely CSRF token from a raw Cookie header value.
+
+    从原始 Cookie 字符串中提取可能的 CSRF Token。
+    """
+
+    for chunk in cookie.split(";"):
+        name, _, value = chunk.strip().partition("=")
+        if name in {"csrf_token", "csrf_access_token", "X-CSRFToken"} and value:
             return value
     return None

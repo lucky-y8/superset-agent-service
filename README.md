@@ -587,7 +587,7 @@ superset-agent-service/
 | 文件 | 说明 |
 | --- | --- |
 | `api/__init__.py` | API 包标记 |
-| `api/router.py` | 聚合 health、agents、runs、admin 路由 |
+| `api/router.py` | 聚合 health、agents、runs、admin、mcp、rag 路由 |
 | `api/health.py` | 健康检查接口 `/api/v1/health` |
 
 ### `auth`
@@ -595,18 +595,19 @@ superset-agent-service/
 | 文件 | 说明 |
 | --- | --- |
 | `auth/__init__.py` | 认证包标记 |
-| `auth/schemas.py` | `PermissionContext`，描述当前用户、租户、角色和可用工具 |
-| `auth/dependencies.py` | 从请求头构造临时权限上下文，未来替换为 SSO / JWT / Superset 登录校验 |
+| `auth/schemas.py` | `PermissionContext`，描述当前用户、租户、角色、可用工具和 MCP Bearer Token |
+| `auth/dependencies.py` | 生产模式从 Superset Agent Token 构造权限上下文，本地开发可使用请求头兜底 |
+| `auth/superset_token.py` | 调用 Superset Token 校验接口，获取真实用户身份、工具范围和 MCP Token |
 
 ### `agents`
 
 | 文件 | 说明 |
 | --- | --- |
 | `agents/__init__.py` | Agent 包标记 |
-| `agents/api.py` | Agent 对话接口 `/api/v1/agents/chat` |
+| `agents/api.py` | Agent 对话接口 `/api/v1/agents/chat` 和 WebSocket 接口 `/api/v1/agents/ws` |
 | `agents/schemas.py` | Agent 请求和响应模型 |
 | `agents/service.py` | Agent 应用服务，负责创建 run、调用 runtime、处理完成和失败 |
-| `agents/runtime.py` | LangGraph Runtime 边界，未来放 Plan + ReAct + Reflection 工作流 |
+| `agents/runtime.py` | LangGraph Runtime，负责模型推理、MCP 工具调用、SQL Guard、Policy Guard 和 RAG 检索 |
 
 ### `runs`
 
@@ -615,7 +616,7 @@ superset-agent-service/
 | `runs/__init__.py` | Run trace 包标记 |
 | `runs/api.py` | Run trace 查询接口 `/api/v1/runs/{run_id}` |
 | `runs/schemas.py` | `RunEvent` 和 `RunTrace` 数据模型 |
-| `runs/service.py` | 当前内存版 run 存储和生命周期事件记录，未来替换为数据库持久化 |
+| `runs/service.py` | 基于 PostgreSQL/SQLAlchemy 的 Run Trace 持久化服务，记录生命周期、事件、耗时和 Token |
 
 ### `tools`
 
@@ -640,7 +641,26 @@ superset-agent-service/
 | 文件 | 说明 |
 | --- | --- |
 | `rag/__init__.py` | RAG 包标记 |
-| `rag/retriever.py` | 检索器边界，未来接向量库、指标口径、Dashboard 文档和业务知识库 |
+| `rag/api.py` | 知识库上传、文档列表和语义检索接口 `/api/v1/rag/*` |
+| `rag/schemas.py` | 知识库文档、上传结果和检索结果的数据模型 |
+| `rag/models.py` | `knowledge_documents`、`knowledge_chunks` ORM 模型 |
+| `rag/service.py` | 协调 OSS、PostgreSQL、通义 Embedding 和 Qdrant 的入库/检索服务 |
+| `rag/text.py` | TXT、Markdown、CSV、Excel、Word、PDF 文本解析和切片 |
+| `rag/embedding.py` | 通义 `text-embedding-v4` 向量生成客户端 |
+| `rag/storage.py` | 阿里云 OSS 原始文件存储适配器 |
+| `rag/vector_store.py` | Qdrant 向量写入和权限过滤检索适配器 |
+| `rag/retriever.py` | Runtime 使用的 RAG 检索边界，未开启 RAG 时不会触网 |
+
+### `memory`
+
+| 文件 | 说明 |
+| --- | --- |
+| `memory/__init__.py` | 长期记忆包标记 |
+| `memory/api.py` | 长期记忆查询、写入和删除接口 `/api/v1/memories` |
+| `memory/schemas.py` | 长期记忆 API 数据模型 |
+| `memory/models.py` | `agent_memories` ORM 模型 |
+| `memory/service.py` | 保留的结构化长期记忆服务，用于手动记忆和兼容 API |
+| `memory/semantic.py` | 基于通义 Embedding + Qdrant 的对话语义长期记忆，Runtime 当前使用这一套 |
 
 ### `guards`
 
@@ -724,9 +744,33 @@ OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_API_KEY=
 OPENAI_MODEL=deepseek-chat
 
-MAX_AGENT_STEPS=12
-MAX_RUN_SECONDS=120
+MAX_AGENT_STEPS=24
+MAX_RUN_SECONDS=240
 MAX_SQL_ROWS=1000
+
+RAG_ENABLED=false
+RAG_TOP_K=5
+RAG_CHUNK_SIZE=900
+RAG_CHUNK_OVERLAP=120
+
+EMBEDDING_PROVIDER=dashscope
+EMBEDDING_MODEL=text-embedding-v4
+EMBEDDING_DIM=1024
+DASHSCOPE_API_KEY=
+DASHSCOPE_EMBEDDING_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_COLLECTION=superset_agent_knowledge
+QDRANT_MEMORY_COLLECTION=superset_agent_memory
+QDRANT_API_KEY=
+SEMANTIC_MEMORY_TOP_K=5
+
+OSS_REGION=cn-hangzhou
+OSS_ENDPOINT=
+OSS_BUCKET=
+OSS_ACCESS_KEY_ID=
+OSS_ACCESS_KEY_SECRET=
+OSS_PREFIX=superset-agent-knowledge
 ```
 
 其中：
@@ -739,6 +783,13 @@ MAX_SQL_ROWS=1000
 - `OPENAI_BASE_URL`：OpenAI 兼容模型接口地址，当前使用 DeepSeek。
 - `OPENAI_API_KEY`：模型 API Key，只写入本地 `.env`，不要提交到 Git。
 - `OPENAI_MODEL`：模型名称，当前使用 `deepseek-chat`。
+- `RAG_ENABLED`：是否启用知识库检索。未启用时 Runtime 不会连接 Qdrant 或 Embedding 服务。
+- `DASHSCOPE_API_KEY`：通义 Embedding API Key，只写入本地 `.env`，不要提交到 Git。
+- `QDRANT_URL` / `QDRANT_COLLECTION`：Qdrant 向量库地址和集合名称。
+- `QDRANT_MEMORY_COLLECTION`：长期语义记忆使用的 Qdrant 集合，默认 `superset_agent_memory`。
+- `SEMANTIC_MEMORY_TOP_K`：每次 Agent 推理前检索多少条相似历史对话。
+- `OSS_REGION` / `OSS_BUCKET`：阿里云 OSS Bucket 地域和名称，用于保存上传原始文件。
+- `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET`：OSS 访问凭证，建议使用 RAM 子账号最小权限。
 
 ### 4. 创建 PostgreSQL 数据库
 
@@ -749,7 +800,8 @@ CREATE DATABASE superset_agent_service;
 ```
 
 这条命令只创建空数据库。项目表结构由 Alembic 管理，不需要手动创建
-`agent_runs` 或 `agent_run_events` 表。
+`agent_runs`、`agent_run_events`、`knowledge_documents`、`knowledge_chunks`
+或 `agent_memories` 表。
 
 ### 5. 使用 Alembic 创建和迁移表结构
 
@@ -765,7 +817,8 @@ CREATE DATABASE superset_agent_service;
 
 - 读取 `.env` 中的 `DATABASE_URL` 并连接 PostgreSQL。
 - 按顺序执行尚未执行的迁移脚本。
-- 首次执行时创建 `alembic_version`、`agent_runs` 和 `agent_run_events`。
+- 首次执行时创建 `alembic_version`、`agent_runs`、`agent_run_events`、
+  `knowledge_documents`、`knowledge_chunks` 和 `agent_memories`。
 - `head` 表示升级到当前代码包含的最新迁移版本。
 
 #### 查看数据库当前迁移版本
@@ -777,7 +830,7 @@ CREATE DATABASE superset_agent_service;
 用途：查看数据库已经执行到哪个版本。当前项目正常应显示：
 
 ```text
-20260611_0001 (head)
+20260622_0004 (head)
 ```
 
 #### 查看全部迁移历史
@@ -831,6 +884,25 @@ CREATE DATABASE superset_agent_service;
 - API 文档：http://127.0.0.1:30000/docs
 - OpenAPI JSON：http://127.0.0.1:30000/api/v1/openapi.json
 - 健康检查：http://127.0.0.1:30000/api/v1/health
+
+### 7. 测试前端页面
+
+项目内置了一个本地测试前端页面：
+
+```text
+http://127.0.0.1:30000/debug
+```
+
+这个页面用于调试 Agent 对话、WebSocket 实时推送、执行步骤、Run Trace 摘要和历史会话恢复。
+页面代码在：
+
+- `superset_agent_service/static/debug.html`
+- `superset_agent_service/static/debug.css`
+- `superset_agent_service/static/debug.js`
+
+当前 `/debug` 页面主要覆盖 Agent 对话测试，还没有加入 RAG 文件上传控件。
+RAG 上传和检索第一版先通过 `/api/v1/rag/documents`、`/api/v1/rag/search`
+接口测试；后续可以把知识库上传、文档列表和检索结果展示集成到该页面或 Superset 前端页面。
 
 ## API 文档
 
@@ -896,6 +968,158 @@ WebSocket 请求建议每次运行时在消息体中携带 Token：
   "answer": "Agent runtime scaffold is ready. Next step: connect Superset MCP tools and replace this placeholder with a LangGraph workflow.",
   "status": "completed"
 }
+```
+
+### RAG 知识库
+
+RAG 功能默认通过 `RAG_ENABLED` 控制。开启后，上传文件会保存原始文件到阿里云 OSS，
+把解析后的文本切片写入 PostgreSQL，并把通义 `text-embedding-v4` 生成的向量写入
+Qdrant。Agent Runtime 在回答前会按当前用户身份检索知识库，把相关片段放入模型上下文。
+
+#### 上传知识文档
+
+```http
+POST /api/v1/rag/documents
+Authorization: Bearer <superset-issued-agent-token>
+Content-Type: multipart/form-data
+
+file=@需求说明.docx
+```
+
+支持的第一批文件类型：
+
+- `.txt`
+- `.md`
+- `.csv`
+- `.xlsx`
+- `.xlsm`
+- `.docx`
+- `.pdf`
+
+响应：
+
+```json
+{
+  "document": {
+    "document_id": "generated-document-id",
+    "filename": "需求说明.docx",
+    "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "status": "indexed",
+    "owner_user_id": "4",
+    "access_scope": "owner",
+    "chunk_count": 12,
+    "error_message": null,
+    "created_at": "2026-06-22T12:00:00Z",
+    "updated_at": "2026-06-22T12:00:03Z"
+  },
+  "message": "Document indexed with 12 chunks."
+}
+```
+
+#### 查询当前用户文档
+
+```http
+GET /api/v1/rag/documents
+Authorization: Bearer <superset-issued-agent-token>
+```
+
+#### 语义检索知识库
+
+```http
+POST /api/v1/rag/search
+Authorization: Bearer <superset-issued-agent-token>
+Content-Type: application/json
+
+{
+  "query": "这个项目的权限认证流程是什么？",
+  "limit": 5
+}
+```
+
+检索结果会按当前用户 `owner_user_id` 过滤，避免不同用户之间互相检索知识文档。
+
+### 长期记忆
+
+长期记忆和 RAG 不同：
+
+- RAG 存外部知识文档，例如 Word、Excel、PDF、业务说明。
+- 长期记忆存用户和 Agent 的历史对话，用于跨会话语义回忆。
+
+当前 Runtime 使用的是企业更常见的语义记忆方案：
+
+```text
+用户问题 + Agent 回答
+  -> 通义 text-embedding-v4 向量化
+  -> 写入 Qdrant 集合 superset_agent_memory
+  -> 下次提问前按 user_id + tenant_id 过滤并语义检索
+  -> 放入 long_term_memory.semantic_conversations
+```
+
+Runtime 会自动做两件事：
+
+1. 每次推理前，用当前问题去 Qdrant 检索当前用户的相似历史对话。
+2. 最终回答生成后，把本轮 `question + answer` 向量化写入 Qdrant。
+
+Qdrant payload 会保存：
+
+- `memory_type=conversation`
+- `user_id`
+- `tenant_id`
+- `run_id`
+- `question`
+- `answer`
+- `text`
+- `created_at`
+
+#### 结构化记忆兼容接口
+
+项目仍保留 `/api/v1/memories` 结构化记忆接口，用于手动记忆、偏好或后续兼容。
+但 Runtime 当前主路径不再依赖 `agent_memories` 表，而是使用 Qdrant 语义记忆。
+
+查询结构化记忆：
+
+```http
+GET /api/v1/memories?limit=50
+Authorization: Bearer <superset-issued-agent-token>
+```
+
+也可以按类型过滤：
+
+```http
+GET /api/v1/memories?memory_type=resource_ref
+Authorization: Bearer <superset-issued-agent-token>
+```
+
+常见 `memory_type`：
+
+- `preference`：用户偏好，例如默认图表语言、常用图表类型
+- `note`：人工保存的重要备注
+- `resource_ref`：兼容旧结构化资源引用
+
+手动写入或更新结构化记忆：
+
+```http
+POST /api/v1/memories
+Authorization: Bearer <superset-issued-agent-token>
+Content-Type: application/json
+
+{
+  "memory_type": "preference",
+  "memory_key": "chart_language",
+  "memory_value": {
+    "value": "zh-CN"
+  },
+  "source": "manual",
+  "confidence": 1.0,
+  "description": "用户希望图表名称优先使用中文。"
+}
+```
+
+删除结构化记忆：
+
+```http
+DELETE /api/v1/memories/{memory_id}
+Authorization: Bearer <superset-issued-agent-token>
 ```
 
 ### 查询 Run Trace
@@ -1102,17 +1326,23 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 
 ### 阶段 4：智能能力
 
-1. 接 RAG 向量库
-2. 加 Reflection 节点
-3. 加 Planner 节点
-4. 加模型路由和 fallback
-5. 加评估数据集和自动测试
+1. 已接入第一版 RAG：通义 `text-embedding-v4`、Qdrant、PostgreSQL、阿里云 OSS
+2. 已接入长期语义记忆：每轮对话通过通义 `text-embedding-v4` 向量化，按用户写入 Qdrant `superset_agent_memory` 集合
+3. 已接入建图任务专项策略：Runtime 会识别查询、RAG、建图、建看板任务，并为建图任务注入 `chart_context`
+4. 加 Reflection 节点
+5. 加 Planner 节点
+6. 加模型路由和 fallback
+7. 加评估数据集和自动测试
 
 ## 开发备注
 
 - 当前 `legacy_user_service/` 是从旧项目改名保留下来的代码，后续可以迁移其中的用户注册、登录、JWT 能力。
-- 当前 `auth/dependencies.py` 通过请求头模拟登录用户，不适合生产。
+- 当前 `auth/dependencies.py` 在配置 `SUPERSET_AGENT_TOKEN_VERIFY_URL` 后会通过 Superset 校验 Agent Token；未配置时才使用请求头作为本地开发兜底。
 - 当前 `runs/service.py` 已异步写入数据库；生产环境应使用 PostgreSQL，并在部署前执行 `alembic upgrade head`。
 - 当前 `SQLGuard` 已使用 `sqlglot` 进行 AST 解析，可拒绝写操作、多语句和动态 LIMIT。
-- 当前 `MCPClient` 是最小占位实现，正式接入 Superset MCP 时要根据实际协议和认证方式调整。
+- 当前 `MCPClient` 已支持 Streamable HTTP / SSE 解析和 Bearer Token 传递；生产环境需要保证 Superset MCP 能正确识别当前用户。
+- 当前 RAG 第一版按上传用户隔离文档；企业版后续可扩展部门、角色、项目空间、文档级 ACL 和审批流程。
+- 当前 Runtime 使用 Qdrant 语义长期记忆，按 `user_id + tenant_id` 过滤历史对话；`agent_memories` 表和 `/api/v1/memories` 作为结构化记忆兼容接口保留。
+- 当前 Runtime 对建图任务使用更高步数预算和建图专用 Prompt；如果用户说“刚生成的数据集”，会优先从语义记忆和请求上下文抽取最近的 `dataset_id`，找不到时要求用户补充数据集 ID 或名称。
+- Runtime 相关单测可使用 `D:\App\python3.13\python.exe -B -m unittest discover -s test -p 'test_agent_runtime.py' -v` 运行。
 

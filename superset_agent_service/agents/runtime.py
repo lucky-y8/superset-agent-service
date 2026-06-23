@@ -7,6 +7,7 @@ import asyncio
 from copy import deepcopy
 import json
 import logging
+import re
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -17,12 +18,24 @@ from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.config import settings
 from superset_agent_service.guards.policy_guard import PolicyGuard
 from superset_agent_service.guards.sql_guard import SQLGuard
+from superset_agent_service.memory.semantic import SemanticMemoryService
+from superset_agent_service.rag.retriever import RAGRetriever
 from superset_agent_service.runs.service import RunService
 from superset_agent_service.tools.mcp_client import MCPClient
 from superset_agent_service.tools.registry import ToolRegistry
 from superset_agent_service.tools.superset_mcp import get_superset_mcp_client
 
 logger = logging.getLogger(__name__)
+
+
+TaskType = Literal["query", "rag", "chart_creation", "dashboard_creation"]
+
+TASK_STEP_LIMITS: dict[str, int] = {
+    "query": 8,
+    "rag": 6,
+    "chart_creation": 16,
+    "dashboard_creation": 20,
+}
 
 
 SYSTEM_PROMPT = """\
@@ -44,6 +57,17 @@ When a list tool supports select_columns, request every field needed to answer
 the user. For dashboard publication questions, list_dashboards must request
 id, dashboard_title, and published. A missing field means "unknown"; never
 interpret a missing boolean field as false.
+
+Chart creation rule:
+When the user asks to create or generate a chart, first identify exactly one
+dataset. If the user says "the newly generated test dataset" but no dataset_id,
+dataset name, or unique prior tool result identifies it in the current request
+context, ask a clarification question instead of guessing. If exactly one
+matching dataset is found, call the dataset metadata tool before creating the
+chart, choose a simple chart type from the available columns, and preserve the
+user's requested Chinese chart name exactly. Do not retry chart generation more
+than two times. If it still fails, stop and explain which parameter or permission
+is missing.
 
 If search_tools and call_tool are available, use search_tools to discover the
 best hidden tool and call_tool to execute it. Give the final answer in the same
@@ -72,6 +96,9 @@ class AgentGraphState(TypedDict):
     pending_tool_calls: list[dict[str, Any]]
     context: PermissionContext
     step: int
+    max_steps: int
+    task_type: TaskType
+    chart_context: dict[str, Any]
     answer: str | None
 
 
@@ -89,6 +116,8 @@ class LangGraphRuntime:
         mcp: MCPClient | None = None,
         policy_guard: PolicyGuard | None = None,
         sql_guard: SQLGuard | None = None,
+        rag: RAGRetriever | None = None,
+        memory: SemanticMemoryService | None = None,
     ):
         """Create the model, MCP, and graph dependencies used by each run.
 
@@ -106,6 +135,8 @@ class LangGraphRuntime:
         self.mcp = mcp or get_superset_mcp_client()
         self.policy_guard = policy_guard or PolicyGuard()
         self.sql_guard = sql_guard or SQLGuard()
+        self.rag = rag or RAGRetriever()
+        self.memory = memory or SemanticMemoryService()
         self.graph = self._build_graph()
 
     async def invoke(self, request: AgentRequest, context: PermissionContext) -> str:
@@ -170,18 +201,55 @@ class LangGraphRuntime:
             },
         )
 
+        knowledge_context = await self._retrieve_knowledge_context(request, context)
+        memory_context = await self._load_memory_context(request, context)
+        task_type = self._classify_task(request.question)
+        max_steps = self._max_steps_for_task(task_type)
+        chart_context = self._build_chart_context(
+            request=request,
+            memory_context=memory_context,
+        )
+
+        await self.runs.record_event(
+            event_type="task_profiled",
+            payload={
+                "task_type": task_type,
+                "max_steps": max_steps,
+                "chart_context": chart_context,
+            },
+        )
+
         initial_state: AgentGraphState = {
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
+                    "role": "system",
+                    "content": self._build_task_prompt(
+                        task_type=task_type,
+                        max_steps=max_steps,
+                        chart_context=chart_context,
+                    ),
+                },
+                {
                     "role": "user",
-                    "content": self._build_user_message(request, context),
+                    "content": self._build_user_message(
+                        request,
+                        context,
+                        knowledge_context=knowledge_context,
+                        memory_context=memory_context,
+                        task_type=task_type,
+                        max_steps=max_steps,
+                        chart_context=chart_context,
+                    ),
                 },
             ],
             "model_tools": model_tools,
             "pending_tool_calls": [],
             "context": context,
             "step": 0,
+            "max_steps": max_steps,
+            "task_type": task_type,
+            "chart_context": chart_context,
             "answer": None,
         }
 
@@ -192,12 +260,134 @@ class LangGraphRuntime:
             # framework's recursion guard.
             # 每轮推理都会经过 model -> tools；额外缓冲允许最后一次 model -> END
             # 转换完成，而不会触发框架的递归保护限制。
-            config={"recursion_limit": settings.MAX_AGENT_STEPS * 2 + 2},
+            config={"recursion_limit": max_steps * 2 + 2},
         )
         answer = final_state.get("answer")
         if not isinstance(answer, str) or not answer.strip():
             raise RuntimeError("LangGraph completed without a final answer")
+        await self._remember_final_answer(
+            request=request,
+            context=context,
+            answer=answer.strip(),
+        )
         return answer.strip()
+
+    async def _load_memory_context(
+        self,
+        request: AgentRequest,
+        context: PermissionContext,
+    ) -> dict[str, Any]:
+        """Load semantically similar long-term memory for this user.
+
+        加载当前用户语义相似的长期记忆。
+        """
+
+        try:
+            memory_context = await self.memory.get_runtime_context(
+                query=request.question,
+                context=context,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Memory loading failed: user_id=%s username=%s error=%s",
+                context.user_id,
+                context.username,
+                exc,
+            )
+            await self.runs.record_event(
+                event_type="memory_failed",
+                payload={"operation": "load", "error": str(exc)},
+            )
+            return {}
+        if any(memory_context.values()):
+            await self.runs.record_event(
+                event_type="memory_loaded",
+                payload={
+                    "semantic_conversation_count": len(
+                        memory_context.get("semantic_conversations", [])
+                    ),
+                },
+            )
+        return memory_context
+
+    async def _remember_final_answer(
+        self,
+        *,
+        request: AgentRequest,
+        context: PermissionContext,
+        answer: str,
+    ) -> None:
+        """Vectorize and persist the latest user question and final answer.
+
+        将最近一次用户问题和最终回答向量化写入长期记忆。
+        """
+
+        try:
+            memory_id = await self.memory.remember_conversation(
+                context=context,
+                question=request.question,
+                answer=answer,
+                run_id=self.runs.run_id,
+            )
+            await self.runs.record_event(
+                event_type="memory_written",
+                payload={
+                    "memory_type": "semantic_conversation",
+                    "memory_id": memory_id,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Memory final-answer write failed: user_id=%s username=%s error=%s",
+                context.user_id,
+                context.username,
+                exc,
+            )
+            await self.runs.record_event(
+                event_type="memory_failed",
+                payload={"operation": "remember_final_answer", "error": str(exc)},
+            )
+
+    async def _retrieve_knowledge_context(
+        self,
+        request: AgentRequest,
+        context: PermissionContext,
+    ) -> list[dict[str, object]]:
+        """Search RAG knowledge before the model starts reasoning.
+
+        在模型开始推理前检索 RAG 知识库。
+        """
+
+        try:
+            results = await self.rag.search(request.question, context=context)
+        except Exception as exc:
+            logger.warning(
+                "RAG retrieval failed: user_id=%s username=%s error=%s",
+                context.user_id,
+                context.username,
+                exc,
+            )
+            await self.runs.record_event(
+                event_type="rag_failed",
+                payload={"error": str(exc)},
+            )
+            return []
+        if results:
+            await self.runs.record_event(
+                event_type="rag_retrieved",
+                payload={
+                    "count": len(results),
+                    "documents": [
+                        {
+                            "document_id": result.get("document_id"),
+                            "filename": result.get("filename"),
+                            "score": result.get("score"),
+                        }
+                        for result in results
+                    ],
+                },
+            )
+        return results
 
     def _bind_mcp_identity(self, context: PermissionContext) -> None:
         """Attach the current user's bearer token to the MCP client when possible.
@@ -250,10 +440,11 @@ class LangGraphRuntime:
         """
 
         step = state["step"] + 1
-        if step > settings.MAX_AGENT_STEPS:
+        max_steps = state["max_steps"]
+        if step > max_steps:
             raise RuntimeError(
-                f"Agent reached MAX_AGENT_STEPS={settings.MAX_AGENT_STEPS} "
-                "without producing a final answer"
+                f"Agent reached max_steps={max_steps} for "
+                f"task_type={state['task_type']} without producing a final answer"
             )
 
         assistant_message = await self.llm.complete(
@@ -653,10 +844,284 @@ class LangGraphRuntime:
             )
         return converted
 
+    @classmethod
+    def _classify_task(cls, question: str) -> TaskType:
+        """Classify a user request into a small runtime strategy bucket.
+
+        将用户请求归类到少量运行时策略类型中。
+        """
+
+        normalized = question.strip().lower()
+        chart_terms = (
+            "生成图表",
+            "创建图表",
+            "新建图表",
+            "画图",
+            "画一个图",
+            "做图",
+            "建图",
+            "chart",
+            "visualization",
+        )
+        dashboard_terms = (
+            "生成仪表盘",
+            "创建仪表盘",
+            "新建仪表盘",
+            "创建看板",
+            "生成看板",
+            "dashboard",
+        )
+        rag_terms = (
+            "知识库",
+            "文档",
+            "文件",
+            "资料",
+            "上传",
+            "pdf",
+            "word",
+            "excel",
+            "rag",
+        )
+        creation_verbs = ("创建", "生成", "新建", "create", "generate", "build")
+        if any(term in normalized for term in dashboard_terms) or (
+            any(verb in normalized for verb in creation_verbs)
+            and any(noun in normalized for noun in ("看板", "仪表盘"))
+        ):
+            return "dashboard_creation"
+        if any(term in normalized for term in chart_terms) or (
+            any(verb in normalized for verb in creation_verbs)
+            and any(noun in normalized for noun in ("图表", "图", "chart"))
+        ):
+            return "chart_creation"
+        if any(term in normalized for term in rag_terms):
+            return "rag"
+        return "query"
+
+    @staticmethod
+    def _max_steps_for_task(task_type: TaskType) -> int:
+        """Return a task-specific step budget.
+
+        返回按任务类型区分的步数预算。
+        """
+
+        return TASK_STEP_LIMITS[task_type]
+
+    @classmethod
+    def _build_task_prompt(
+        cls,
+        *,
+        task_type: TaskType,
+        max_steps: int,
+        chart_context: dict[str, Any],
+    ) -> str:
+        """Build a narrow strategy prompt for the classified task.
+
+        为已分类任务构建更窄的策略提示。
+        """
+
+        base = (
+            f"Runtime task profile: task_type={task_type}, max_steps={max_steps}. "
+            "Stay inside this step budget and stop with a clear question if the "
+            "required resource cannot be identified."
+        )
+        if task_type != "chart_creation":
+            return base
+
+        return (
+            f"{base}\n"
+            "Chart workflow:\n"
+            "1. Use chart_context.last_dataset_id when present. Do not search for "
+            "another dataset unless the user explicitly asks for a different one.\n"
+            "2. If the user refers to a newly generated, previous, or current "
+            "dataset and chart_context has no last_dataset_id, ask for the dataset "
+            "ID or name instead of guessing.\n"
+            "3. Read dataset metadata at most once before generate_chart.\n"
+            "4. Preserve the requested Chinese chart name exactly.\n"
+            "5. Retry generate_chart at most once after a parameter/schema error. "
+            "For permission errors, stop and explain the permission issue.\n"
+            "chart_context:\n"
+            f"{json.dumps(chart_context, ensure_ascii=False, default=str)}"
+        )
+
+    @classmethod
+    def _build_chart_context(
+        cls,
+        *,
+        request: AgentRequest,
+        memory_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Extract the latest Superset resource references for chart creation.
+
+        提取建图任务可复用的最近 Superset 资源引用。
+        """
+
+        context: dict[str, Any] = {
+            "last_dataset_id": None,
+            "last_dataset_name": None,
+            "last_chart_id": request.chart_id,
+            "last_dashboard_id": request.dashboard_id,
+            "source": None,
+            "needs_dataset_clarification": False,
+        }
+
+        cls._merge_resource_refs(context, request.filters, source="request.filters")
+        conversations = memory_context.get("semantic_conversations")
+        if isinstance(conversations, list):
+            for item in conversations:
+                if not isinstance(item, dict):
+                    continue
+                cls._merge_resource_refs(context, item, source="semantic_memory")
+                for key in ("answer", "text", "question"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        cls._merge_resource_refs(
+                            context,
+                            cls._extract_resource_refs_from_text(value),
+                            source="semantic_memory",
+                        )
+
+        if cls._uses_recent_reference(request.question) and not context["last_dataset_id"]:
+            context["needs_dataset_clarification"] = True
+        return context
+
+    @classmethod
+    def _merge_resource_refs(
+        cls,
+        target: dict[str, Any],
+        value: Any,
+        *,
+        source: str,
+    ) -> None:
+        """Merge known Superset resource IDs into a compact context object.
+
+        将已知 Superset 资源 ID 合并到紧凑上下文对象中。
+        """
+
+        for item in cls._walk_mappings(value):
+            lowered = {str(key).lower(): key for key in item}
+            dataset_id = cls._first_value(
+                item,
+                lowered,
+                ("dataset_id", "datasource_id"),
+            )
+            chart_id = cls._first_value(item, lowered, ("chart_id", "slice_id"))
+            dashboard_id = cls._first_value(item, lowered, ("dashboard_id",))
+            dataset_name = cls._first_value(
+                item,
+                lowered,
+                ("dataset_name", "table_name", "name"),
+            )
+            if dataset_id and not target.get("last_dataset_id"):
+                target["last_dataset_id"] = str(dataset_id)
+                target["source"] = source
+            if dataset_name and not target.get("last_dataset_name"):
+                target["last_dataset_name"] = str(dataset_name)
+            if chart_id and not target.get("last_chart_id"):
+                target["last_chart_id"] = str(chart_id)
+            if dashboard_id and not target.get("last_dashboard_id"):
+                target["last_dashboard_id"] = str(dashboard_id)
+
+    @staticmethod
+    def _extract_resource_refs_from_text(text: str) -> dict[str, Any]:
+        """Extract common resource IDs from natural-language memories.
+
+        从自然语言记忆文本中提取常见资源 ID。
+        """
+
+        refs: dict[str, Any] = {}
+        patterns = {
+            "dataset_id": (
+                r'"dataset_id"\s*:\s*"?(\d+)"?',
+                r"\bdataset[_\s-]*id\s*[:=：]?\s*(\d+)",
+                r"数据集\s*(?:id|ID)?\s*[:=：]?\s*(\d+)",
+            ),
+            "chart_id": (
+                r'"chart_id"\s*:\s*"?(\d+)"?',
+                r"\bchart[_\s-]*id\s*[:=：]?\s*(\d+)",
+                r"图表\s*(?:id|ID)?\s*[:=：]?\s*(\d+)",
+            ),
+            "dashboard_id": (
+                r'"dashboard_id"\s*:\s*"?(\d+)"?',
+                r"\bdashboard[_\s-]*id\s*[:=：]?\s*(\d+)",
+                r"(?:仪表盘|看板)\s*(?:id|ID)?\s*[:=：]?\s*(\d+)",
+            ),
+        }
+        for key, key_patterns in patterns.items():
+            for pattern in key_patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    refs[key] = match.group(1)
+                    break
+        return refs
+
+    @staticmethod
+    def _uses_recent_reference(question: str) -> bool:
+        """Return whether the user refers to a recent implicit resource.
+
+        判断用户是否引用了最近生成或上一个隐式资源。
+        """
+
+        normalized = question.lower()
+        return any(
+            term in normalized
+            for term in (
+                "刚生成",
+                "刚才",
+                "上一个",
+                "这个数据集",
+                "该数据集",
+                "当前数据集",
+                "newly generated",
+                "previous dataset",
+                "this dataset",
+            )
+        )
+
+    @classmethod
+    def _walk_mappings(cls, value: Any) -> list[dict[str, Any]]:
+        """Return all dictionaries nested inside a JSON-like value.
+
+        返回 JSON 类值中嵌套的所有字典。
+        """
+
+        if isinstance(value, dict):
+            found = [value]
+            for nested in value.values():
+                found.extend(cls._walk_mappings(nested))
+            return found
+        if isinstance(value, list):
+            found: list[dict[str, Any]] = []
+            for item in value:
+                found.extend(cls._walk_mappings(item))
+            return found
+        return []
+
+    @staticmethod
+    def _first_value(
+        item: dict[str, Any],
+        lowered_keys: dict[str, Any],
+        candidates: tuple[str, ...],
+    ) -> Any:
+        """Return the first non-empty value among case-insensitive keys.
+
+        按大小写不敏感字段名返回第一个非空值。
+        """
+
+        for candidate in candidates:
+            key = lowered_keys.get(candidate)
+            if key is not None and item.get(key) not in (None, ""):
+                return item.get(key)
+        return None
+
     @staticmethod
     def _build_user_message(
         request: AgentRequest,
         context: PermissionContext,
+        knowledge_context: list[dict[str, object]] | None = None,
+        memory_context: dict[str, Any] | None = None,
+        task_type: TaskType = "query",
+        max_steps: int | None = None,
+        chart_context: dict[str, Any] | None = None,
     ) -> str:
         """Combine the question with optional UI context without changing it.
 
@@ -675,6 +1140,13 @@ class LangGraphRuntime:
                 "allowed_tools": context.allowed_tools,
                 "allowed_dataset_ids": context.allowed_dataset_ids,
             },
+            "retrieved_knowledge": knowledge_context or [],
+            "long_term_memory": memory_context or {},
+            "task_profile": {
+                "task_type": task_type,
+                "max_steps": max_steps,
+            },
+            "chart_context": chart_context or {},
         }
         return (
             f"User question:\n{request.question}\n\n"

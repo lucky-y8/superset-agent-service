@@ -41,6 +41,16 @@ class AgentSocketContext(BaseModel):
     roles: list[str] = Field(default_factory=lambda: ["admin"])
 
 
+class SupersetTokenProxyRequest(BaseModel):
+    """Request a Superset-issued Agent token through the local debug proxy.
+
+    通过本地调试代理请求 Superset 签发的 Agent Token。
+    """
+
+    superset_base_url: str = "http://localhost:9000"
+    cookie: str = ""
+
+
 class AgentSocketRequest(BaseModel):
     """One Agent run requested over the persistent WebSocket connection.
 

@@ -1,18 +1,45 @@
-"""Retrieval boundary for future business knowledge and metadata search.
+"""Retrieval boundary used by Agent Runtime.
 
-为未来业务知识与元数据检索预留的边界。
+Agent Runtime 使用的检索边界。
 """
 
-class RAGRetriever:
-    """Define the asynchronous interface for future retrieval backends.
+from superset_agent_service.auth.schemas import PermissionContext
+from superset_agent_service.config import settings
+from superset_agent_service.rag.service import KnowledgeService
 
-    定义未来检索后端需要实现的异步接口。
+
+class RAGRetriever:
+    """Search business knowledge through the configured RAG backend.
+
+    通过配置好的 RAG 后端检索业务知识。
     """
 
-    async def search(self, query: str, limit: int = 5) -> list[dict[str, object]]:
-        """Return matching knowledge records; currently no backend is connected.
+    def __init__(self, service: KnowledgeService | None = None) -> None:
+        """Create a retriever with replaceable service dependency.
 
-        返回匹配的知识记录；当前尚未接入实际检索后端。
+        创建一个服务依赖可替换的检索器。
         """
 
-        return []
+        self.service = service
+
+    async def search(
+        self,
+        query: str,
+        *,
+        context: PermissionContext,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Return permission-scoped matching knowledge records.
+
+        返回经过权限限定的匹配知识记录。
+        """
+
+        if not settings.RAG_ENABLED:
+            return []
+        service = self.service or KnowledgeService()
+        results = await service.search(
+            query=query,
+            limit=limit or settings.RAG_TOP_K,
+            context=context,
+        )
+        return [result.model_dump() for result in results]

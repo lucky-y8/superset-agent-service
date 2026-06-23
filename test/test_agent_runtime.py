@@ -138,6 +138,64 @@ class FakeMCP:
         }
 
 
+class FakeRAG:
+    """Return no knowledge so Runtime unit tests never call external RAG services.
+
+    返回空知识结果，确保 Runtime 单元测试不会调用外部 RAG 服务。
+    """
+
+    async def search(self, query, *, context, limit=None):
+        """Match the RAGRetriever interface used by the Runtime.
+
+        匹配 Runtime 使用的 RAGRetriever 接口。
+        """
+
+        return []
+
+
+class FakeSemanticMemory:
+    """Keep Runtime tests away from real embedding and Qdrant services.
+
+    让 Runtime 测试不触发真实 Embedding 和 Qdrant 服务。
+    """
+
+    def __init__(
+        self,
+        runtime_context: dict[str, object] | None = None,
+    ) -> None:
+        """Track stored conversations for assertions or debugging.
+
+        记录写入的对话，便于断言或调试。
+        """
+
+        self.conversations = []
+        self.runtime_context = runtime_context or {"semantic_conversations": []}
+
+    async def get_runtime_context(self, *, query, context, limit=None):
+        """Return no semantic memories by default.
+
+        默认不返回语义记忆。
+        """
+
+        return self.runtime_context
+
+    async def remember_conversation(self, *, context, question, answer, run_id=None):
+        """Record the conversation without external calls.
+
+        记录对话但不调用外部服务。
+        """
+
+        self.conversations.append(
+            {
+                "user_id": context.user_id,
+                "question": question,
+                "answer": answer,
+                "run_id": run_id,
+            }
+        )
+        return "memory-1"
+
+
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
     """Verify Runtime graph behavior without external network services.
 
@@ -185,6 +243,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runs=runs,
             llm=llm,
             mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         answer = await runtime.invoke(
@@ -229,6 +289,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runs=runs,
             llm=llm,
             mcp=FakeMCP(),
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         await runtime.invoke(
@@ -260,6 +322,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runs=runs,
             llm=llm,
             mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         answer = await runtime.invoke(
@@ -296,6 +360,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runs=runs,
             llm=llm,
             mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         await runtime.invoke(
@@ -330,6 +396,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runs=runs,
             llm=FakeLLM(),
             mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         await runtime.invoke(
@@ -340,6 +408,90 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             mcp.calls,
             [("list_dashboards", {"request": {"page": 1}})],
+        )
+
+    async def test_chart_task_uses_semantic_memory_dataset_context(self):
+        """Confirm chart tasks receive a compact dataset context from memory.
+
+        验证建图任务会从语义记忆中获得紧凑的数据集上下文。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("chart-context-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="Create a chart from the previous dataset"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+        memory = FakeSemanticMemory(
+            runtime_context={
+                "semantic_conversations": [
+                    {
+                        "question": "Create test data",
+                        "answer": "Created dataset_id: 42 named 测试销售数据",
+                    }
+                ]
+            }
+        )
+        llm = FakeLLM(
+            tool_name="get_dataset_info",
+            tool_arguments='{"request":{"id":42}}',
+            final_answer="已根据数据集 42 准备建图。",
+        )
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=FakeMCP(tool_name="get_dataset_info"),
+            rag=FakeRAG(),
+            memory=memory,
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="Create a chart from the previous dataset"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+
+        first_messages = llm.received_messages[0]
+        task_prompt = first_messages[1]["content"]
+        user_prompt = first_messages[2]["content"]
+        self.assertIn("task_type=chart_creation", task_prompt)
+        self.assertIn('"last_dataset_id": "42"', task_prompt)
+        self.assertIn('"task_type": "chart_creation"', user_prompt)
+        self.assertIn('"last_dataset_id": "42"', user_prompt)
+
+        trace = await RunService.get_trace("chart-context-run", self.sessions)
+        event_types = [event.event_type for event in trace.events]
+        self.assertIn("task_profiled", event_types)
+        task_event = next(
+            event for event in trace.events if event.event_type == "task_profiled"
+        )
+        self.assertEqual(task_event.payload["task_type"], "chart_creation")
+        self.assertEqual(task_event.payload["max_steps"], 16)
+
+    def test_task_classification_and_step_budgets_are_dynamic(self):
+        """Confirm Runtime no longer uses one fixed step budget for all tasks.
+
+        验证 Runtime 不再对所有任务使用同一个固定步数预算。
+        """
+
+        self.assertEqual(
+            LangGraphRuntime._classify_task("根据刚生成的数据集生成图表"),
+            "chart_creation",
+        )
+        self.assertEqual(
+            LangGraphRuntime._classify_task("查询知识库里的部署文档"),
+            "rag",
+        )
+        self.assertEqual(
+            LangGraphRuntime._classify_task("创建一个新的看板"),
+            "dashboard_creation",
+        )
+        self.assertEqual(LangGraphRuntime._max_steps_for_task("query"), 8)
+        self.assertEqual(LangGraphRuntime._max_steps_for_task("rag"), 6)
+        self.assertEqual(LangGraphRuntime._max_steps_for_task("chart_creation"), 16)
+        self.assertEqual(
+            LangGraphRuntime._max_steps_for_task("dashboard_creation"),
+            20,
         )
 
     async def test_runtime_rewrites_sql_before_mcp_call(self):
@@ -365,6 +517,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             llm=llm,
             mcp=mcp,
             sql_guard=SQLGuard(max_rows=100),
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         await runtime.invoke(
@@ -403,6 +557,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runs=runs,
             llm=llm,
             mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
         )
 
         answer = await runtime.invoke(
