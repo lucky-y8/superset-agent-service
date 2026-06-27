@@ -11,6 +11,7 @@ from sqlalchemy.pool import StaticPool
 from superset_agent_service.agents.runtime import LangGraphRuntime
 from superset_agent_service.agents.schemas import AgentRequest
 from superset_agent_service.auth.schemas import PermissionContext
+from superset_agent_service.config import settings
 from superset_agent_service.db.base import Base
 from superset_agent_service.guards.sql_guard import SQLGuard
 from superset_agent_service.runs.service import RunService
@@ -224,6 +225,16 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         await self.engine.dispose()
 
+    def set_delegate_auth_to_mcp(self, value: bool) -> None:
+        """Temporarily override MCP authorization delegation for one test.
+
+        为单个测试临时覆盖 MCP 权限委托开关。
+        """
+
+        original = settings.AGENT_DELEGATE_AUTH_TO_MCP
+        settings.AGENT_DELEGATE_AUTH_TO_MCP = value
+        self.addCleanup(setattr, settings, "AGENT_DELEGATE_AUTH_TO_MCP", original)
+
     async def test_runtime_executes_mcp_tool_and_returns_final_answer(self):
         """Confirm one complete model-tool-model cycle and its trace events.
 
@@ -309,6 +320,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         验证非管理员不能执行白名单之外的工具。
         """
 
+        self.set_delegate_auth_to_mcp(False)
         runs = RunService(session_factory=self.sessions)
         runs.bind_run("policy-denied-run", "viewer-user")
         await runs.start_run(
@@ -333,13 +345,13 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(answer, "权限不足，无法调用工具。")
         self.assertEqual(mcp.calls, [])
-        tool_message = llm.received_messages[1][-1]
-        self.assertEqual(tool_message["role"], "tool")
-        self.assertIn("Permission denied", tool_message["content"])
+        self.assertEqual(llm.calls, 1)
 
         trace = await RunService.get_trace("policy-denied-run", self.sessions)
         event_types = [event.event_type for event in trace.events]
         self.assertIn("tool_blocked", event_types)
+        self.assertIn("reflection_checked", event_types)
+        self.assertIn("reflection_stopped", event_types)
 
     async def test_runtime_allows_non_admin_tool_from_allow_list(self):
         """Confirm explicit tool allow-lists let non-admin users execute tools.
@@ -347,6 +359,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         验证明示工具白名单允许非管理员执行指定工具。
         """
 
+        self.set_delegate_auth_to_mcp(False)
         runs = RunService(session_factory=self.sessions)
         runs.bind_run("policy-allowed-run", "analyst-user")
         await runs.start_run(
@@ -377,6 +390,47 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             mcp.calls,
             [("list_dashboards", {"request": {"page": 1}})],
         )
+
+    async def test_runtime_delegates_tool_authorization_to_mcp_by_default(self):
+        """Confirm visible MCP tools are not blocked by Agent allow-list by default.
+
+        验证默认将业务工具权限委托给 MCP，不被 Agent 白名单二次拦截。
+        """
+
+        self.set_delegate_auth_to_mcp(True)
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("policy-delegated-run", "creator-user")
+        await runs.start_run(
+            AgentRequest(question="创建一个看板"),
+            PermissionContext(user_id="creator-user", roles=["authenticated"]),
+        )
+        llm = FakeLLM(
+            tool_name="generate_dashboard",
+            tool_arguments='{"request":{"dashboard_title":"测试看板"}}',
+            final_answer="已创建看板。",
+        )
+        mcp = FakeMCP(tool_name="generate_dashboard")
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="创建一个看板"),
+            PermissionContext(user_id="creator-user", roles=["authenticated"]),
+        )
+
+        self.assertEqual(
+            mcp.calls,
+            [("generate_dashboard", {"request": {"dashboard_title": "测试看板"}})],
+        )
+        trace = await RunService.get_trace("policy-delegated-run", self.sessions)
+        event_types = [event.event_type for event in trace.events]
+        self.assertNotIn("tool_blocked", event_types)
 
     async def test_runtime_treats_admin_role_case_insensitively(self):
         """Confirm Superset-style ``Admin`` role names can execute tools.
@@ -486,13 +540,172 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             LangGraphRuntime._classify_task("创建一个新的看板"),
             "dashboard_creation",
         )
+        self.assertEqual(
+            LangGraphRuntime._classify_task("创建一个新的数据集"),
+            "dataset_creation",
+        )
         self.assertEqual(LangGraphRuntime._max_steps_for_task("query"), 8)
         self.assertEqual(LangGraphRuntime._max_steps_for_task("rag"), 6)
+        self.assertEqual(LangGraphRuntime._max_steps_for_task("dataset_creation"), 16)
         self.assertEqual(LangGraphRuntime._max_steps_for_task("chart_creation"), 16)
         self.assertEqual(
             LangGraphRuntime._max_steps_for_task("dashboard_creation"),
             20,
         )
+
+    async def test_guided_mode_adds_creation_task_questions_when_enabled(self):
+        """Confirm guided mode asks for choices before creation workflows.
+
+        验证开启引导模式后，创建类任务会先要求补全必要选择。
+        """
+
+        original_guided_mode = settings.AGENT_GUIDED_MODE
+        settings.AGENT_GUIDED_MODE = True
+        try:
+            runs = RunService(session_factory=self.sessions)
+            runs.bind_run("guided-mode-run", "local-user")
+            await runs.start_run(
+                AgentRequest(question="我要创建一个看板图表和数据集"),
+                PermissionContext(user_id="local-user", roles=["admin"]),
+            )
+            llm = FakeLLM(final_answer="请先选择数据库连接。")
+            runtime = LangGraphRuntime(
+                tools=ToolRegistry.default(),
+                runs=runs,
+                llm=llm,
+                mcp=FakeMCP(),
+                rag=FakeRAG(),
+                memory=FakeSemanticMemory(),
+            )
+
+            await runtime.invoke(
+                AgentRequest(question="我要创建一个看板图表和数据集"),
+                PermissionContext(user_id="local-user", roles=["admin"]),
+            )
+        finally:
+            settings.AGENT_GUIDED_MODE = original_guided_mode
+
+        self.assertEqual(llm.calls, 0)
+
+        trace = await RunService.get_trace("guided-mode-run", self.sessions)
+        task_event = next(
+            event for event in trace.events if event.event_type == "task_profiled"
+        )
+        self.assertTrue(task_event.payload["guided_mode"])
+        planner_event = next(
+            event for event in trace.events if event.event_type == "planner_created"
+        )
+        self.assertEqual(planner_event.payload["task_type"], "dashboard_creation")
+        self.assertIn("database", planner_event.payload["missing_info"])
+        guided_event = next(
+            event for event in trace.events if event.event_type == "guided_question"
+        )
+        self.assertIn("数据库连接", guided_event.payload["question"])
+
+    async def test_guided_planner_continues_when_creation_context_is_complete(self):
+        """Confirm guided planner does not block when required choices exist.
+
+        验证必要信息已齐全时，引导式 Planner 不会阻断执行。
+        """
+
+        original_guided_mode = settings.AGENT_GUIDED_MODE
+        settings.AGENT_GUIDED_MODE = True
+        try:
+            runs = RunService(session_factory=self.sessions)
+            runs.bind_run("guided-complete-run", "local-user")
+            await runs.start_run(
+                AgentRequest(question="创建一个柱状图"),
+                PermissionContext(user_id="local-user", roles=["admin"]),
+            )
+            llm = FakeLLM(final_answer="开始创建图表。")
+            runtime = LangGraphRuntime(
+                tools=ToolRegistry.default(),
+                runs=runs,
+                llm=llm,
+                mcp=FakeMCP(),
+                rag=FakeRAG(),
+                memory=FakeSemanticMemory(),
+            )
+
+            await runtime.invoke(
+                AgentRequest(
+                    question="创建一个柱状图",
+                    filters={
+                        "dataset_id": 42,
+                        "chart_type": "bar",
+                        "chart_name": "销售柱状图",
+                    },
+                ),
+                PermissionContext(user_id="local-user", roles=["admin"]),
+            )
+        finally:
+            settings.AGENT_GUIDED_MODE = original_guided_mode
+
+        self.assertGreater(llm.calls, 0)
+        trace = await RunService.get_trace("guided-complete-run", self.sessions)
+        planner_event = next(
+            event for event in trace.events if event.event_type == "planner_created"
+        )
+        self.assertEqual(planner_event.payload["missing_info"], [])
+
+    async def test_generate_chart_arguments_are_normalized_from_context(self):
+        """Confirm chart aliases are normalized before calling MCP.
+
+        验证建图参数别名会在调用 MCP 前被规范化。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("chart-normalize-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="创建图表"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+        llm = FakeLLM(
+            tool_name="generate_chart",
+            tool_arguments='{"request":{"title":"销售柱状图","chart_type":"bar"}}',
+            final_answer="图表已创建。",
+        )
+        mcp = FakeMCP(tool_name="generate_chart")
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
+        )
+
+        await runtime.invoke(
+            AgentRequest(
+                question="创建图表",
+                filters={"dataset_id": 42},
+            ),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+
+        request_args = mcp.calls[0][1]["request"]
+        self.assertEqual(request_args["dataset_id"], 42)
+        self.assertEqual(request_args["slice_name"], "销售柱状图")
+        self.assertEqual(request_args["viz_type"], "echarts_timeseries_bar")
+
+        trace = await RunService.get_trace("chart-normalize-run", self.sessions)
+        event_types = [event.event_type for event in trace.events]
+        self.assertIn("chart_arguments_normalized", event_types)
+
+    def test_guided_prompt_is_absent_when_disabled(self):
+        """Confirm guided mode remains off by default.
+
+        验证引导模式默认关闭。
+        """
+
+        prompt = LangGraphRuntime._build_task_prompt(
+            task_type="dashboard_creation",
+            max_steps=20,
+            guided_mode=False,
+            chart_context={},
+        )
+
+        self.assertNotIn("Guided mode is enabled", prompt)
 
     async def test_runtime_rewrites_sql_before_mcp_call(self):
         """Confirm SQLGuard clamps excessive LIMIT values before MCP execution.
@@ -534,6 +747,49 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         event_types = [event.event_type for event in trace.events]
         self.assertIn("sql_guard_rewritten", event_types)
 
+    async def test_runtime_strips_untrusted_content_tags_from_sql(self):
+        """Confirm copied MCP boundary tags are removed before SQL execution.
+
+        验证模型误复制的 MCP 数据边界标签会在执行 SQL 前被移除。
+        """
+
+        runs = RunService(session_factory=self.sessions)
+        runs.bind_run("sql-untrusted-tag-run", "local-user")
+        await runs.start_run(
+            AgentRequest(question="执行 SQL"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+        llm = FakeLLM(
+            tool_name="run_sql",
+            tool_arguments=(
+                '{"request":{"sql":"<UNTRUSTED-CONTENT>\\n'
+                'SELECT id FROM dashboards\\n</UNTRUSTED-CONTENT>"}}'
+            ),
+        )
+        mcp = FakeMCP(tool_name="run_sql")
+        runtime = LangGraphRuntime(
+            tools=ToolRegistry.default(),
+            runs=runs,
+            llm=llm,
+            mcp=mcp,
+            rag=FakeRAG(),
+            memory=FakeSemanticMemory(),
+        )
+
+        await runtime.invoke(
+            AgentRequest(question="执行 SQL"),
+            PermissionContext(user_id="local-user", roles=["admin"]),
+        )
+
+        self.assertEqual(len(mcp.calls), 1)
+        cleaned_sql = mcp.calls[0][1]["request"]["sql"]
+        self.assertNotIn("UNTRUSTED-CONTENT", cleaned_sql)
+        self.assertIn("SELECT", cleaned_sql)
+
+        trace = await RunService.get_trace("sql-untrusted-tag-run", self.sessions)
+        event_types = [event.event_type for event in trace.events]
+        self.assertIn("sql_guard_rewritten", event_types)
+
     async def test_runtime_blocks_unsafe_sql_before_mcp_call(self):
         """Confirm unsafe SQL is returned as a tool error without calling MCP.
 
@@ -568,8 +824,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(answer, "SQL 被安全策略拦截。")
         self.assertEqual(mcp.calls, [])
-        tool_message = llm.received_messages[1][-1]
-        self.assertIn("SQLGuard blocked SQL", tool_message["content"])
+        self.assertEqual(llm.calls, 1)
 
         trace = await RunService.get_trace("sql-block-run", self.sessions)
         failed_events = [
@@ -578,6 +833,9 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             if event.event_type == "tool_failed"
         ]
         self.assertTrue(failed_events)
+        event_types = [event.event_type for event in trace.events]
+        self.assertIn("reflection_checked", event_types)
+        self.assertIn("reflection_stopped", event_types)
 
     def test_mcp_schema_is_converted_to_function_tool(self):
         """Confirm MCP schemas are translated into model function definitions.

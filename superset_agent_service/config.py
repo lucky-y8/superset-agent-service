@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # repeated checks during one active chat while keeping revocation reasonably fresh.
     # 短暂缓存校验成功的结果，减少同一轮对话反复请求 Superset，同时让权限回收仍能较快生效。
     AGENT_TOKEN_VERIFY_CACHE_SECONDS: int = 60
+    # Delegate business tool authorization to Superset MCP. The Agent service
+    # still verifies tokens and runs safety guards, but it no longer treats
+    # allowed_tools from the token verifier as the final MCP tool allow-list.
+    # 将业务工具权限委托给 Superset MCP。Agent 服务仍校验 Token 并执行安全护栏，但不再把
+    # Token 验证接口返回的 allowed_tools 当作最终 MCP 工具白名单。
+    AGENT_DELEGATE_AUTH_TO_MCP: bool = True
 
     # DeepSeek exposes an OpenAI-compatible chat-completions API.  Keeping
     # these names provider-neutral lets the Runtime switch to another
@@ -61,6 +67,10 @@ class Settings(BaseSettings):
     MAX_AGENT_STEPS: int = 12
     MAX_RUN_SECONDS: int = 120
     MAX_SQL_ROWS: int = 1000
+    # When enabled, creation tasks ask the user for required choices before
+    # calling Superset tools. It is disabled by default to preserve automation.
+    # 开启后，创建类任务会先引导用户补全必要选择，再调用 Superset 工具；默认关闭以保留自动执行体验。
+    AGENT_GUIDED_MODE: bool = False
 
     # Retrieval Augmented Generation configuration.
     # RAG（检索增强生成）相关配置。

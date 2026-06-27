@@ -747,6 +747,8 @@ OPENAI_MODEL=deepseek-chat
 MAX_AGENT_STEPS=24
 MAX_RUN_SECONDS=240
 MAX_SQL_ROWS=1000
+AGENT_GUIDED_MODE=false
+AGENT_DELEGATE_AUTH_TO_MCP=true
 
 RAG_ENABLED=false
 RAG_TOP_K=5
@@ -1344,5 +1346,9 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 - 当前 RAG 第一版按上传用户隔离文档；企业版后续可扩展部门、角色、项目空间、文档级 ACL 和审批流程。
 - 当前 Runtime 使用 Qdrant 语义长期记忆，按 `user_id + tenant_id` 过滤历史对话；`agent_memories` 表和 `/api/v1/memories` 作为结构化记忆兼容接口保留。
 - 当前 Runtime 对建图任务使用更高步数预算和建图专用 Prompt；如果用户说“刚生成的数据集”，会优先从语义记忆和请求上下文抽取最近的 `dataset_id`，找不到时要求用户补充数据集 ID 或名称。
+- 当前 Runtime 会在调用 `generate_chart` 前规范化常见建图参数：从请求上下文补 `dataset_id`，把 `title/chart_name` 映射为 `slice_name`，把 `chart_type` 映射为 `viz_type`，并记录 `chart_arguments_normalized` 事件。
+- 当前 `AGENT_GUIDED_MODE=false` 默认关闭；改为 `true` 后，创建数据集、图表、看板会先进入独立 Planner 节点。Planner 会生成结构化计划和缺失信息列表，缺少数据库连接、数据来源、图表类型、看板名称等必要信息时先提问，信息齐全后才进入 ReAct 工具执行。
+- 当前 `AGENT_DELEGATE_AUTH_TO_MCP=true` 默认开启，业务工具权限交给 Superset MCP 判断；Agent Service 仍校验 Token、执行 SQLGuard/Reflection，但不再把 Token verify 返回的 `allowed_tools` 当作 MCP 工具白名单，避免“工具可见但 Agent 自己拒绝调用”。
+- 当前 Runtime 已接入 Reflection 节点：每轮工具执行后会检查 observation，权限错误和危险 SQL 会立即停止，可恢复的参数/工具错误会交回模型进行一次修正。
 - Runtime 相关单测可使用 `D:\App\python3.13\python.exe -B -m unittest discover -s test -p 'test_agent_runtime.py' -v` 运行。
 

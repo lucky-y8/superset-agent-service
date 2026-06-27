@@ -6,6 +6,7 @@
 import logging
 
 from superset_agent_service.auth.schemas import PermissionContext
+from superset_agent_service.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,15 @@ class PolicyGuard:
 
         判断当前身份是否可以执行指定工具。
         """
+
+        if settings.AGENT_DELEGATE_AUTH_TO_MCP:
+            logger.info(
+                "PolicyGuard delegated tool authorization to MCP: user_id=%s username=%s tool=%s",
+                context.user_id,
+                context.username,
+                tool_name,
+            )
+            return True
 
         if context.is_admin:
             logger.info(

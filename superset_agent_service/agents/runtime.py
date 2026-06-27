@@ -28,14 +28,23 @@ from superset_agent_service.tools.superset_mcp import get_superset_mcp_client
 logger = logging.getLogger(__name__)
 
 
-TaskType = Literal["query", "rag", "chart_creation", "dashboard_creation"]
+TaskType = Literal[
+    "query",
+    "rag",
+    "dataset_creation",
+    "chart_creation",
+    "dashboard_creation",
+]
 
 TASK_STEP_LIMITS: dict[str, int] = {
     "query": 8,
     "rag": 6,
+    "dataset_creation": 16,
     "chart_creation": 16,
     "dashboard_creation": 20,
 }
+
+GUIDED_TASK_TYPES = {"dataset_creation", "chart_creation", "dashboard_creation"}
 
 
 SYSTEM_PROMPT = """\
@@ -94,10 +103,15 @@ class AgentGraphState(TypedDict):
     messages: list[dict[str, Any]]
     model_tools: list[dict[str, Any]]
     pending_tool_calls: list[dict[str, Any]]
+    request: AgentRequest
     context: PermissionContext
+    last_tool_messages: list[dict[str, Any]]
+    reflection: dict[str, Any] | None
     step: int
     max_steps: int
     task_type: TaskType
+    guided_mode: bool
+    guided_plan: dict[str, Any] | None
     chart_context: dict[str, Any]
     answer: str | None
 
@@ -205,6 +219,7 @@ class LangGraphRuntime:
         memory_context = await self._load_memory_context(request, context)
         task_type = self._classify_task(request.question)
         max_steps = self._max_steps_for_task(task_type)
+        guided_mode = settings.AGENT_GUIDED_MODE
         chart_context = self._build_chart_context(
             request=request,
             memory_context=memory_context,
@@ -215,6 +230,7 @@ class LangGraphRuntime:
             payload={
                 "task_type": task_type,
                 "max_steps": max_steps,
+                "guided_mode": guided_mode,
                 "chart_context": chart_context,
             },
         )
@@ -227,6 +243,7 @@ class LangGraphRuntime:
                     "content": self._build_task_prompt(
                         task_type=task_type,
                         max_steps=max_steps,
+                        guided_mode=guided_mode,
                         chart_context=chart_context,
                     ),
                 },
@@ -239,16 +256,22 @@ class LangGraphRuntime:
                         memory_context=memory_context,
                         task_type=task_type,
                         max_steps=max_steps,
+                        guided_mode=guided_mode,
                         chart_context=chart_context,
                     ),
                 },
             ],
             "model_tools": model_tools,
             "pending_tool_calls": [],
+            "request": request,
             "context": context,
+            "last_tool_messages": [],
+            "reflection": None,
             "step": 0,
             "max_steps": max_steps,
             "task_type": task_type,
+            "guided_mode": guided_mode,
+            "guided_plan": None,
             "chart_context": chart_context,
             "answer": None,
         }
@@ -422,16 +445,72 @@ class LangGraphRuntime:
         """
 
         builder = StateGraph(AgentGraphState)
+        builder.add_node("planner", self._planner_node)
         builder.add_node("model", self._model_node)
         builder.add_node("tools", self._tools_node)
-        builder.add_edge(START, "model")
+        builder.add_node("reflection", self._reflection_node)
+        builder.add_edge(START, "planner")
+        builder.add_conditional_edges(
+            "planner",
+            self._route_after_planner,
+            {"model": "model", "end": END},
+        )
         builder.add_conditional_edges(
             "model",
             self._route_after_model,
             {"tools": "tools", "end": END},
         )
-        builder.add_edge("tools", "model")
+        builder.add_edge("tools", "reflection")
+        builder.add_conditional_edges(
+            "reflection",
+            self._route_after_reflection,
+            {"model": "model", "end": END},
+        )
         return builder.compile()
+
+    async def _planner_node(self, state: AgentGraphState) -> dict[str, Any]:
+        """Create a structured plan before model/tool execution.
+
+        在模型和工具执行前创建结构化计划。
+        """
+
+        plan = self._build_guided_plan(
+            request=state["request"],
+            task_type=state["task_type"],
+            guided_mode=state["guided_mode"],
+            chart_context=state["chart_context"],
+        )
+        await self.runs.record_event(
+            event_type="planner_created",
+            payload=plan,
+        )
+
+        next_question = plan.get("next_question")
+        if isinstance(next_question, str) and next_question.strip():
+            await self.runs.record_event(
+                event_type="guided_question",
+                payload={
+                    "task_type": state["task_type"],
+                    "missing_info": plan.get("missing_info", []),
+                    "question": next_question,
+                },
+            )
+            return {
+                "guided_plan": plan,
+                "answer": next_question.strip(),
+                "pending_tool_calls": [],
+            }
+
+        return {"guided_plan": plan}
+
+    @staticmethod
+    def _route_after_planner(state: AgentGraphState) -> Literal["model", "end"]:
+        """End early when the planner needs user input.
+
+        当 Planner 需要用户补充信息时提前结束。
+        """
+
+        return "end" if state["answer"] else "model"
 
     async def _model_node(self, state: AgentGraphState) -> dict[str, Any]:
         """Ask DeepSeek for either a final answer or the next MCP tool calls.
@@ -508,13 +587,180 @@ class LangGraphRuntime:
                 await self._execute_tool_call(
                     tool_call=tool_call,
                     context=state["context"],
+                    request=state["request"],
+                    chart_context=state["chart_context"],
                 )
             )
 
         return {
             "messages": [*state["messages"], *tool_messages],
             "pending_tool_calls": [],
+            "last_tool_messages": tool_messages,
         }
+
+    async def _reflection_node(self, state: AgentGraphState) -> dict[str, Any]:
+        """Inspect tool observations and decide whether to continue or stop.
+
+        检查工具观察结果，并决定继续修正还是停止。
+        """
+
+        reflection = self._reflect_on_tool_messages(
+            state["last_tool_messages"],
+            step=state["step"],
+        )
+        await self.runs.record_event(
+            event_type="reflection_checked",
+            payload=reflection,
+        )
+
+        if reflection["decision"] == "stop":
+            await self.runs.record_event(
+                event_type="reflection_stopped",
+                payload=reflection,
+            )
+            return {
+                "reflection": reflection,
+                "answer": str(reflection["message"]),
+                "pending_tool_calls": [],
+            }
+
+        if reflection["decision"] == "retry":
+            await self.runs.record_event(
+                event_type="reflection_retry",
+                payload=reflection,
+            )
+        return {"reflection": reflection}
+
+    @staticmethod
+    def _route_after_reflection(state: AgentGraphState) -> Literal["model", "end"]:
+        """Continue after recoverable errors, or end after hard failures.
+
+        可恢复错误后继续；硬失败后结束。
+        """
+
+        reflection = state.get("reflection") or {}
+        return "end" if reflection.get("decision") == "stop" else "model"
+
+    @classmethod
+    def _reflect_on_tool_messages(
+        cls,
+        tool_messages: list[dict[str, Any]],
+        *,
+        step: int,
+    ) -> dict[str, Any]:
+        """Classify the latest tool observations for retry control.
+
+        对最新工具观察结果分类，用于控制是否重试。
+        """
+
+        errors = cls._tool_errors(tool_messages)
+        if not errors:
+            return {
+                "decision": "continue",
+                "reason": "all_tools_succeeded",
+                "step": step,
+                "errors": [],
+                "message": None,
+            }
+
+        hard_error = next(
+            (
+                error
+                for error in errors
+                if error["category"] in {"permission_denied", "unsafe_sql"}
+            ),
+            None,
+        )
+        if hard_error:
+            return {
+                "decision": "stop",
+                "reason": hard_error["category"],
+                "step": step,
+                "errors": errors,
+                "message": cls._reflection_stop_message(hard_error),
+            }
+
+        return {
+            "decision": "retry",
+            "reason": "recoverable_tool_error",
+            "step": step,
+            "errors": errors,
+            "message": (
+                "A tool returned a recoverable error. Adjust the arguments once, "
+                "then stop and explain the problem if it fails again."
+            ),
+        }
+
+    @classmethod
+    def _tool_errors(cls, tool_messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """Extract structured errors from OpenAI-compatible tool messages.
+
+        从 OpenAI 兼容 tool 消息中提取结构化错误。
+        """
+
+        errors: list[dict[str, str]] = []
+        for message in tool_messages:
+            content = message.get("content")
+            parsed = cls._maybe_json_object(content)
+            error = parsed.get("error") if isinstance(parsed, dict) else None
+            if not error:
+                continue
+            tool_name = str(parsed.get("tool") or message.get("name") or "")
+            error_text = str(error)
+            errors.append(
+                {
+                    "tool": tool_name,
+                    "error": error_text,
+                    "category": cls._classify_tool_error(error_text),
+                }
+            )
+        return errors
+
+    @staticmethod
+    def _maybe_json_object(value: Any) -> dict[str, Any]:
+        """Parse a JSON object string, returning an empty object on failure.
+
+        解析 JSON 对象字符串，失败时返回空对象。
+        """
+
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            return {}
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _classify_tool_error(error_text: str) -> str:
+        """Classify tool errors into retry or stop categories.
+
+        将工具错误分类为可重试或应停止类型。
+        """
+
+        normalized = error_text.lower()
+        if "permission denied" in normalized or "forbidden" in normalized:
+            return "permission_denied"
+        if "sqlguard blocked" in normalized or "forbidden operation" in normalized:
+            return "unsafe_sql"
+        if "missing" in normalized or "invalid" in normalized or "schema" in normalized:
+            return "invalid_arguments"
+        return "tool_error"
+
+    @staticmethod
+    def _reflection_stop_message(error: dict[str, str]) -> str:
+        """Build a user-facing stop message for hard failures.
+
+        为硬失败构建面向用户的停止说明。
+        """
+
+        if error["category"] == "permission_denied":
+            return "权限不足，无法调用工具。"
+        if error["category"] == "unsafe_sql":
+            return "SQL 被安全策略拦截。"
+        return f"工具 {error['tool']} 执行失败：{error['error']}"
 
     @staticmethod
     def _route_after_model(state: AgentGraphState) -> Literal["tools", "end"]:
@@ -568,6 +814,8 @@ class LangGraphRuntime:
         self,
         tool_call: dict[str, Any],
         context: PermissionContext,
+        request: AgentRequest,
+        chart_context: dict[str, Any],
     ) -> dict[str, Any]:
         """Validate one model tool request, call MCP, and build a tool message.
 
@@ -596,6 +844,18 @@ class LangGraphRuntime:
             ) from exc
         if not isinstance(arguments, dict):
             raise RuntimeError(f"Tool arguments for {name} must be a JSON object")
+
+        arguments, chart_rewrite_events = self._normalize_chart_arguments(
+            tool_name=name,
+            arguments=arguments,
+            request=request,
+            chart_context=chart_context,
+        )
+        for detail in chart_rewrite_events:
+            await self.runs.record_event(
+                event_type="chart_arguments_normalized",
+                payload={"tool": name, **detail},
+            )
 
         logger.info(
             "Runtime tool requested: user_id=%s username=%s tool=%s arguments=%s",
@@ -697,9 +957,89 @@ class LangGraphRuntime:
             await self.runs.record_event(
                 event_type="tool_failed",
                 payload={"tool": name, "error": str(exc)},
-            )
+        )
 
         return self._tool_message(call_id=call_id, name=name, content=content)
+
+    def _normalize_chart_arguments(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        request: AgentRequest,
+        chart_context: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Normalize common chart-generation aliases before MCP execution.
+
+        在执行 MCP 前规范化常见建图参数别名。
+        """
+
+        if tool_name != "generate_chart":
+            return arguments, []
+
+        normalized = deepcopy(arguments)
+        request_args = normalized.get("request")
+        if not isinstance(request_args, dict):
+            request_args = {}
+            normalized["request"] = request_args
+
+        filters = request.filters if isinstance(request.filters, dict) else {}
+        events: list[dict[str, Any]] = []
+
+        def fill(target_key: str, value: Any, source: str) -> None:
+            if value in (None, "") or request_args.get(target_key) not in (None, ""):
+                return
+            request_args[target_key] = value
+            events.append({"field": target_key, "source": source})
+
+        dataset_id = self._first_nested_value(
+            request_args,
+            ("dataset_id", "datasource_id"),
+        ) or self._first_nested_value(
+            filters,
+            ("dataset_id", "datasource_id"),
+        ) or chart_context.get("last_dataset_id")
+        fill("dataset_id", dataset_id, "chart_context_or_request")
+
+        chart_type = self._first_nested_value(
+            request_args,
+            ("viz_type", "chart_type", "visualization_type"),
+        ) or self._first_nested_value(
+            filters,
+            ("viz_type", "chart_type", "visualization_type"),
+        )
+        fill("viz_type", chart_type, "chart_type_alias")
+
+        chart_name = self._first_nested_value(
+            request_args,
+            ("slice_name", "chart_name", "title"),
+        ) or self._first_nested_value(
+            filters,
+            ("slice_name", "chart_name", "title"),
+        )
+        fill("slice_name", chart_name, "chart_name_alias")
+
+        dashboard_id = request.dashboard_id or self._first_nested_value(
+            filters,
+            ("dashboard_id", "dashboard"),
+        ) or chart_context.get("last_dashboard_id")
+        fill("dashboard_id", dashboard_id, "dashboard_context")
+
+        if request_args.get("viz_type") == "bar":
+            # Superset commonly expects ECharts-oriented viz identifiers.
+            # Keep this tiny mapping conservative and leave unknown values alone.
+            # Superset 常用 ECharts 风格的图表标识。这里只做非常保守的映射，未知值保持原样。
+            request_args["viz_type"] = "echarts_timeseries_bar"
+            events.append(
+                {
+                    "field": "viz_type",
+                    "source": "chart_type_template",
+                    "from": "bar",
+                    "to": "echarts_timeseries_bar",
+                }
+            )
+
+        return normalized, events
 
     def _guard_sql_arguments(
         self,
@@ -770,14 +1110,29 @@ class LangGraphRuntime:
         返回安全 SQL；不安全时抛出清晰错误供模型观察。
         """
 
-        result = self.sql_guard.validate(sql)
+        sanitized_sql = self._strip_untrusted_content_tags(sql)
+        result = self.sql_guard.validate(sanitized_sql)
         if not result.allowed:
             raise RuntimeError(
                 f"SQLGuard blocked SQL for {tool_name} at {'.'.join(path)}: "
                 f"{result.reason}"
             )
-        rewritten_sql = result.rewritten_sql or sql
+        rewritten_sql = result.rewritten_sql or sanitized_sql
         return rewritten_sql, rewritten_sql != sql
+
+    @staticmethod
+    def _strip_untrusted_content_tags(sql: str) -> str:
+        """Remove MCP data-boundary tags that models may accidentally copy.
+
+        移除模型可能误复制进 SQL 的 MCP 数据边界标签。
+        """
+
+        return re.sub(
+            r"</?UNTRUSTED-CONTENT>",
+            "",
+            sql,
+            flags=re.IGNORECASE,
+        ).strip()
 
     @staticmethod
     def _is_sql_argument_key(key: str) -> bool:
@@ -871,6 +1226,12 @@ class LangGraphRuntime:
             "生成看板",
             "dashboard",
         )
+        dataset_terms = (
+            "生成数据集",
+            "创建数据集",
+            "新建数据集",
+            "dataset",
+        )
         rag_terms = (
             "知识库",
             "文档",
@@ -893,6 +1254,11 @@ class LangGraphRuntime:
             and any(noun in normalized for noun in ("图表", "图", "chart"))
         ):
             return "chart_creation"
+        if any(term in normalized for term in dataset_terms) or (
+            any(verb in normalized for verb in creation_verbs)
+            and "数据集" in normalized
+        ):
+            return "dataset_creation"
         if any(term in normalized for term in rag_terms):
             return "rag"
         return "query"
@@ -912,6 +1278,7 @@ class LangGraphRuntime:
         *,
         task_type: TaskType,
         max_steps: int,
+        guided_mode: bool,
         chart_context: dict[str, Any],
     ) -> str:
         """Build a narrow strategy prompt for the classified task.
@@ -924,6 +1291,21 @@ class LangGraphRuntime:
             "Stay inside this step budget and stop with a clear question if the "
             "required resource cannot be identified."
         )
+        if guided_mode and task_type in GUIDED_TASK_TYPES:
+            return (
+                f"{base}\n"
+                "Guided mode is enabled.\n"
+                "Before calling creation tools, guide the user step by step and "
+                "ask for missing required choices. Ask one concise question at a "
+                "time unless several choices are tightly related. Do not invent "
+                "database connections, datasets, chart types, dashboard names, "
+                "owners, or SQL. Prefer questions such as: which database "
+                "connection should be used, which table or SQL should define the "
+                "dataset, which dataset should the chart use, which chart type is "
+                "preferred, and what dashboard title should be created. If enough "
+                "information is already present in request context or memory, say "
+                "what you will use and ask only for the missing piece."
+            )
         if task_type != "chart_creation":
             return base
 
@@ -942,6 +1324,173 @@ class LangGraphRuntime:
             "chart_context:\n"
             f"{json.dumps(chart_context, ensure_ascii=False, default=str)}"
         )
+
+    @classmethod
+    def _build_guided_plan(
+        cls,
+        *,
+        request: AgentRequest,
+        task_type: TaskType,
+        guided_mode: bool,
+        chart_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build a deterministic planner output for guided creation tasks.
+
+        为引导式创建任务构建确定性的 Planner 输出。
+        """
+
+        known_context = cls._known_creation_context(
+            request=request,
+            chart_context=chart_context,
+        )
+        missing_info: list[str] = []
+        if guided_mode and task_type in GUIDED_TASK_TYPES:
+            missing_info = cls._missing_creation_info(
+                task_type=task_type,
+                known_context=known_context,
+            )
+
+        return {
+            "planner": "guided_creation_planner",
+            "enabled": guided_mode,
+            "task_type": task_type,
+            "goal": request.question,
+            "known_context": known_context,
+            "missing_info": missing_info,
+            "steps": cls._planned_steps(task_type),
+            "next_question": cls._next_guided_question(missing_info),
+        }
+
+    @classmethod
+    def _known_creation_context(
+        cls,
+        *,
+        request: AgentRequest,
+        chart_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Collect creation choices already available from request context.
+
+        收集请求上下文中已经具备的创建任务选择。
+        """
+
+        filters = request.filters if isinstance(request.filters, dict) else {}
+        return {
+            "database": cls._first_nested_value(
+                filters,
+                ("database_id", "database_name", "database", "db_id"),
+            ),
+            "data_source": cls._first_nested_value(
+                filters,
+                ("table_name", "table", "sql", "query_sql", "dataset_sql"),
+            ),
+            "dataset": (
+                request.filters.get("dataset_id")
+                if isinstance(request.filters, dict)
+                else None
+            )
+            or chart_context.get("last_dataset_id")
+            or chart_context.get("last_dataset_name"),
+            "chart_type": cls._first_nested_value(
+                filters,
+                ("chart_type", "viz_type", "visualization_type"),
+            ),
+            "chart_name": cls._first_nested_value(
+                filters,
+                ("chart_name", "slice_name", "title"),
+            ),
+            "dashboard": request.dashboard_id
+            or cls._first_nested_value(
+                filters,
+                ("dashboard_id", "dashboard_title", "dashboard_name"),
+            ),
+        }
+
+    @classmethod
+    def _missing_creation_info(
+        cls,
+        *,
+        task_type: TaskType,
+        known_context: dict[str, Any],
+    ) -> list[str]:
+        """Return required choices that guided mode should ask for.
+
+        返回引导模式需要询问的必要选择。
+        """
+
+        missing: list[str] = []
+        if task_type in {"dataset_creation", "dashboard_creation"}:
+            if not known_context.get("database"):
+                missing.append("database")
+            if not known_context.get("data_source"):
+                missing.append("data_source")
+        if task_type in {"chart_creation", "dashboard_creation"}:
+            if not known_context.get("dataset"):
+                missing.append("dataset")
+            if not known_context.get("chart_type"):
+                missing.append("chart_type")
+            if not known_context.get("chart_name"):
+                missing.append("chart_name")
+        if task_type == "dashboard_creation" and not known_context.get("dashboard"):
+            missing.append("dashboard")
+        return missing
+
+    @staticmethod
+    def _planned_steps(task_type: TaskType) -> list[str]:
+        """Return high-level steps for Run Trace visibility.
+
+        返回用于 Run Trace 展示的高层步骤。
+        """
+
+        if task_type == "dataset_creation":
+            return ["choose_database", "choose_data_source", "create_dataset"]
+        if task_type == "chart_creation":
+            return ["choose_dataset", "choose_chart_type", "create_chart"]
+        if task_type == "dashboard_creation":
+            return [
+                "choose_database",
+                "choose_data_source",
+                "create_dataset",
+                "create_chart",
+                "create_dashboard",
+            ]
+        return ["answer_question"]
+
+    @staticmethod
+    def _next_guided_question(missing_info: list[str]) -> str | None:
+        """Ask only the next missing question in guided mode.
+
+        在引导模式中只询问下一个缺失问题。
+        """
+
+        if not missing_info:
+            return None
+        questions = {
+            "database": "请先选择要使用的数据库连接。你希望使用哪个 Superset 数据库连接？",
+            "data_source": "数据集要来自哪张表，还是你希望我根据一段 SQL 创建？",
+            "dataset": "请告诉我要使用哪个数据集，可以给数据集 ID 或名称。",
+            "chart_type": "你想创建什么图表类型？例如柱状图、折线图、饼图或表格。",
+            "chart_name": "这个图表名称叫什么？如果需要中文名称，请直接告诉我中文标题。",
+            "dashboard": "看板名称叫什么，或者要加入哪个已有看板？",
+        }
+        return questions.get(missing_info[0])
+
+    @classmethod
+    def _first_nested_value(
+        cls,
+        value: Any,
+        keys: tuple[str, ...],
+    ) -> Any:
+        """Find the first non-empty value for any key in nested mappings.
+
+        在嵌套字典中查找任意字段的第一个非空值。
+        """
+
+        wanted = {key.lower() for key in keys}
+        for item in cls._walk_mappings(value):
+            for key, nested_value in item.items():
+                if str(key).lower() in wanted and nested_value not in (None, ""):
+                    return nested_value
+        return None
 
     @classmethod
     def _build_chart_context(
@@ -1121,6 +1670,7 @@ class LangGraphRuntime:
         memory_context: dict[str, Any] | None = None,
         task_type: TaskType = "query",
         max_steps: int | None = None,
+        guided_mode: bool = False,
         chart_context: dict[str, Any] | None = None,
     ) -> str:
         """Combine the question with optional UI context without changing it.
@@ -1137,7 +1687,16 @@ class LangGraphRuntime:
                 "user_id": context.user_id,
                 "username": context.username,
                 "roles": context.roles,
-                "allowed_tools": context.allowed_tools,
+                "authorization_mode": (
+                    "delegated_to_mcp"
+                    if settings.AGENT_DELEGATE_AUTH_TO_MCP
+                    else "agent_policy_guard"
+                ),
+                "allowed_tools": (
+                    None
+                    if settings.AGENT_DELEGATE_AUTH_TO_MCP
+                    else context.allowed_tools
+                ),
                 "allowed_dataset_ids": context.allowed_dataset_ids,
             },
             "retrieved_knowledge": knowledge_context or [],
@@ -1145,6 +1704,7 @@ class LangGraphRuntime:
             "task_profile": {
                 "task_type": task_type,
                 "max_steps": max_steps,
+                "guided_mode": guided_mode,
             },
             "chart_context": chart_context or {},
         }
