@@ -8,17 +8,20 @@ from copy import deepcopy
 import json
 import logging
 import re
+from time import perf_counter
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from superset_agent_service.agents.llm_client import OpenAICompatibleChatClient
 from superset_agent_service.agents.schemas import AgentRequest
+from superset_agent_service.audit.logger import AuditLogger
 from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.config import settings
 from superset_agent_service.guards.policy_guard import PolicyGuard
 from superset_agent_service.guards.sql_guard import SQLGuard
 from superset_agent_service.memory.semantic import SemanticMemoryService
+from superset_agent_service.metrics.collector import MetricsCollector
 from superset_agent_service.rag.retriever import RAGRetriever
 from superset_agent_service.runs.service import RunService
 from superset_agent_service.tools.mcp_client import MCPClient
@@ -132,6 +135,8 @@ class LangGraphRuntime:
         sql_guard: SQLGuard | None = None,
         rag: RAGRetriever | None = None,
         memory: SemanticMemoryService | None = None,
+        metrics: MetricsCollector | None = None,
+        audit: AuditLogger | None = None,
     ):
         """Create the model, MCP, and graph dependencies used by each run.
 
@@ -151,6 +156,8 @@ class LangGraphRuntime:
         self.sql_guard = sql_guard or SQLGuard()
         self.rag = rag or RAGRetriever()
         self.memory = memory or SemanticMemoryService()
+        self.metrics = metrics or MetricsCollector(session_factory=runs.session_factory)
+        self.audit = audit or AuditLogger(session_factory=runs.session_factory)
         self.graph = self._build_graph()
 
     async def invoke(self, request: AgentRequest, context: PermissionContext) -> str:
@@ -283,7 +290,7 @@ class LangGraphRuntime:
             # framework's recursion guard.
             # 每轮推理都会经过 model -> tools；额外缓冲允许最后一次 model -> END
             # 转换完成，而不会触发框架的递归保护限制。
-            config={"recursion_limit": max_steps * 2 + 2},
+            config={"recursion_limit": max_steps * 3 + 4},
         )
         answer = final_state.get("answer")
         if not isinstance(answer, str) or not answer.strip():
@@ -526,12 +533,14 @@ class LangGraphRuntime:
                 f"task_type={state['task_type']} without producing a final answer"
             )
 
+        started_at = perf_counter()
         assistant_message = await self.llm.complete(
             state["messages"],
             state["model_tools"],
             on_content_delta=self._publish_answer_delta,
         )
-        await self._record_model_usage(assistant_message)
+        latency_ms = int((perf_counter() - started_at) * 1000)
+        await self._record_model_usage(assistant_message, latency_ms=latency_ms)
         messages = [*state["messages"], assistant_message]
         raw_tool_calls = assistant_message.get("tool_calls", [])
         tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
@@ -782,19 +791,84 @@ class LangGraphRuntime:
             payload={"delta": delta},
         )
 
-    async def _record_model_usage(self, assistant_message: dict[str, Any]) -> None:
+    async def _record_model_usage(
+        self,
+        assistant_message: dict[str, Any],
+        *,
+        latency_ms: int | None = None,
+    ) -> None:
         """Persist model usage metrics when the provider includes them.
 
         当模型服务返回用量信息时，将其持久化到运行记录。
         """
 
         usage = assistant_message.get("_usage")
-        if not isinstance(usage, dict):
-            return
-        await self.runs.record_model_usage(
-            input_tokens=self._optional_int(usage.get("prompt_tokens")),
-            output_tokens=self._optional_int(usage.get("completion_tokens")),
-            total_tokens=self._optional_int(usage.get("total_tokens")),
+        usage_available = isinstance(usage, dict)
+        usage_payload = usage if usage_available else {}
+        input_tokens = self._optional_int(usage_payload.get("prompt_tokens"))
+        output_tokens = self._optional_int(usage_payload.get("completion_tokens"))
+        total_tokens = self._optional_int(usage_payload.get("total_tokens"))
+        if usage_available:
+            await self.runs.record_model_usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
+        if self.runs.run_id:
+            await self.metrics.record_model_call(
+                run_id=self.runs.run_id,
+                provider=self._model_provider_name(),
+                model=settings.OPENAI_MODEL,
+                input_tokens=input_tokens or 0,
+                output_tokens=output_tokens or 0,
+                total_tokens=total_tokens,
+                latency_ms=latency_ms,
+                details={
+                    "usage_available": usage_available,
+                    "finish_reason": assistant_message.get("finish_reason"),
+                    "tool_call_count": len(assistant_message.get("tool_calls") or []),
+                },
+            )
+
+    @staticmethod
+    def _model_provider_name() -> str:
+        """Return a compact provider name for model metrics.
+
+        为模型指标返回简洁的模型服务商名称。
+        """
+
+        base_url = settings.OPENAI_BASE_URL.lower()
+        if "deepseek" in base_url:
+            return "deepseek"
+        if "dashscope" in base_url or "aliyun" in base_url:
+            return "dashscope"
+        if "openai" in base_url:
+            return "openai"
+        return "openai_compatible"
+
+    async def _record_audit(
+        self,
+        context: PermissionContext,
+        *,
+        action: str,
+        resource_type: str | None = None,
+        resource_id: str | None = None,
+        outcome: str = "success",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist one audit event tied to the current run when available.
+
+        持久化一条审计事件，并在可用时绑定当前 run。
+        """
+
+        await self.audit.record_context(
+            context,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            outcome=outcome,
+            run_id=self.runs.run_id,
+            metadata=metadata,
         )
 
     @staticmethod
@@ -864,6 +938,13 @@ class LangGraphRuntime:
             name,
             self._summarize_for_log(arguments),
         )
+        await self._record_audit(
+            context,
+            action="tool_requested",
+            resource_type="mcp_tool",
+            resource_id=name,
+            metadata={"arguments_summary": self._summarize_for_log(arguments)},
+        )
 
         if not self.policy_guard.can_use_tool(context=context, tool_name=name):
             content = json.dumps(
@@ -884,6 +965,18 @@ class LangGraphRuntime:
                     "allowed_tools": context.allowed_tools,
                 },
             )
+            await self._record_audit(
+                context,
+                action="tool_blocked",
+                resource_type="mcp_tool",
+                resource_id=name,
+                outcome="denied",
+                metadata={
+                    "reason": "permission_denied",
+                    "roles": context.roles,
+                    "allowed_tools": context.allowed_tools,
+                },
+            )
             return self._tool_message(call_id=call_id, name=name, content=content)
 
         try:
@@ -899,6 +992,14 @@ class LangGraphRuntime:
             await self.runs.record_event(
                 event_type="tool_failed",
                 payload={"tool": name, "error": str(exc)},
+            )
+            await self._record_audit(
+                context,
+                action="tool_blocked",
+                resource_type="mcp_tool",
+                resource_id=name,
+                outcome="denied",
+                metadata={"reason": "sql_guard", "error": str(exc)},
             )
             return self._tool_message(call_id=call_id, name=name, content=content)
 
@@ -939,6 +1040,13 @@ class LangGraphRuntime:
                     "result_summary": self._summarize_for_log(result),
                 },
             )
+            await self._record_audit(
+                context,
+                action="tool_completed",
+                resource_type="mcp_tool",
+                resource_id=name,
+                metadata={"result_summary": self._summarize_for_log(result)},
+            )
         except Exception as exc:
             logger.exception(
                 "MCP tool failed: user_id=%s username=%s tool=%s",
@@ -957,7 +1065,15 @@ class LangGraphRuntime:
             await self.runs.record_event(
                 event_type="tool_failed",
                 payload={"tool": name, "error": str(exc)},
-        )
+            )
+            await self._record_audit(
+                context,
+                action="tool_failed",
+                resource_type="mcp_tool",
+                resource_id=name,
+                outcome="failure",
+                metadata={"error": str(exc)},
+            )
 
         return self._tool_message(call_id=call_id, name=name, content=content)
 

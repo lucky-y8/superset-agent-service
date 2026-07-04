@@ -11,8 +11,10 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from superset_agent_service.config import settings
+from superset_agent_service.audit import models as audit_models  # noqa: F401
 from superset_agent_service.db.base import Base
 from superset_agent_service.memory import models as memory_models  # noqa: F401
+from superset_agent_service.metrics import models as metrics_models  # noqa: F401
 from superset_agent_service.rag import models as rag_models  # noqa: F401
 from superset_agent_service.runs import models  # noqa: F401
 

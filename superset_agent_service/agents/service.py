@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from superset_agent_service.agents.runtime import LangGraphRuntime
 from superset_agent_service.agents.schemas import AgentRequest, AgentResponse
+from superset_agent_service.audit.logger import AuditLogger
 from superset_agent_service.auth.schemas import PermissionContext
 from superset_agent_service.runs.service import RunService
 from superset_agent_service.tools.registry import ToolRegistry
@@ -29,8 +30,13 @@ class AgentService:
         """
 
         self.runs = RunService(event_sink=event_sink)
+        self.audit = AuditLogger(session_factory=self.runs.session_factory)
         self.tools = ToolRegistry.default()
-        self.runtime = LangGraphRuntime(tools=self.tools, runs=self.runs)
+        self.runtime = LangGraphRuntime(
+            tools=self.tools,
+            runs=self.runs,
+            audit=self.audit,
+        )
 
     async def chat(
         self, request: AgentRequest, context: PermissionContext
@@ -43,13 +49,42 @@ class AgentService:
         run_id = str(uuid4())
         self.runs.bind_run(run_id=run_id, user_id=context.user_id)
         await self.runs.start_run(request=request, context=context)
+        await self.audit.record_context(
+            context,
+            action="agent_run_started",
+            resource_type="agent_run",
+            resource_id=run_id,
+            run_id=run_id,
+            metadata={
+                "question": request.question,
+                "dashboard_id": request.dashboard_id,
+                "chart_id": request.chart_id,
+            },
+        )
 
         try:
             answer = await self.runtime.invoke(request=request, context=context)
             await self.runs.complete_run(status="completed", final_answer=answer)
+            await self.audit.record_context(
+                context,
+                action="agent_run_completed",
+                resource_type="agent_run",
+                resource_id=run_id,
+                run_id=run_id,
+                metadata={"answer_length": len(answer)},
+            )
             return AgentResponse(run_id=run_id, answer=answer, status="completed")
         except Exception as exc:
             # Record failure before re-raising so observability is never lost.
             # 重新抛出异常前先记录失败，避免丢失可观测信息。
             await self.runs.fail_run(error=str(exc))
+            await self.audit.record_context(
+                context,
+                action="agent_run_failed",
+                resource_type="agent_run",
+                resource_id=run_id,
+                run_id=run_id,
+                outcome="failure",
+                metadata={"error": str(exc)},
+            )
             raise

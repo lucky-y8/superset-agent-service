@@ -467,7 +467,7 @@ FastAPI Agent Service
 
 - **SQLAlchemy Async**：异步数据库访问边界
 - **Alembic**：数据库迁移工具
-- **PostgreSQL + asyncpg**：持久化 Agent Run Trace，开发和生产使用同一套迁移流程
+- **PostgreSQL + asyncpg**：持久化 Agent Run Trace、Metrics、Audit，开发和生产使用同一套迁移流程
 
 ### Agent 能力
 
@@ -480,8 +480,8 @@ FastAPI Agent Service
 
 - **Policy Guard**：工具调用权限控制
 - **SQL Guard**：SQL 安全检查边界
-- **Audit Logger**：审计记录边界
-- **Metrics Collector**：token、成本、延迟、模型调用统计边界
+- **Audit Logger**：持久化用户、Agent Run、MCP 工具调用和安全拦截审计事件
+- **Metrics Collector**：持久化 token、成本、延迟、模型调用状态和模型服务商统计
 
 ## 项目结构
 
@@ -675,14 +675,16 @@ superset-agent-service/
 | 文件 | 说明 |
 | --- | --- |
 | `audit/__init__.py` | 审计包标记 |
-| `audit/logger.py` | 审计日志边界，用于记录谁在什么时间对什么资源执行了什么操作 |
+| `audit/models.py` | `agent_audit_logs` ORM 模型 |
+| `audit/logger.py` | 数据库审计日志服务，用于记录谁在什么时间对什么资源执行了什么操作 |
 
 ### `metrics`
 
 | 文件 | 说明 |
 | --- | --- |
 | `metrics/__init__.py` | 指标采集包标记 |
-| `metrics/collector.py` | 模型调用指标采集边界，未来记录 token、成本、延迟、模型和状态 |
+| `metrics/models.py` | `agent_metrics` ORM 模型 |
+| `metrics/collector.py` | 模型调用指标采集服务，记录 token、成本、延迟、模型和状态 |
 
 ### `admin`
 
@@ -802,8 +804,8 @@ CREATE DATABASE superset_agent_service;
 ```
 
 这条命令只创建空数据库。项目表结构由 Alembic 管理，不需要手动创建
-`agent_runs`、`agent_run_events`、`knowledge_documents`、`knowledge_chunks`
-或 `agent_memories` 表。
+`agent_runs`、`agent_run_events`、`knowledge_documents`、`knowledge_chunks`、
+`agent_memories`、`agent_metrics` 或 `agent_audit_logs` 表。
 
 ### 5. 使用 Alembic 创建和迁移表结构
 
@@ -820,7 +822,8 @@ CREATE DATABASE superset_agent_service;
 - 读取 `.env` 中的 `DATABASE_URL` 并连接 PostgreSQL。
 - 按顺序执行尚未执行的迁移脚本。
 - 首次执行时创建 `alembic_version`、`agent_runs`、`agent_run_events`、
-  `knowledge_documents`、`knowledge_chunks` 和 `agent_memories`。
+  `knowledge_documents`、`knowledge_chunks`、`agent_memories`、`agent_metrics`
+  和 `agent_audit_logs`。
 - `head` 表示升级到当前代码包含的最新迁移版本。
 
 #### 查看数据库当前迁移版本
@@ -832,7 +835,7 @@ CREATE DATABASE superset_agent_service;
 用途：查看数据库已经执行到哪个版本。当前项目正常应显示：
 
 ```text
-20260622_0004 (head)
+20260629_0005 (head)
 ```
 
 #### 查看全部迁移历史
@@ -1185,8 +1188,8 @@ GET /api/v1/admin/runtime-config
 - RAG Retriever 边界
 - SQL Guard 初版
 - Policy Guard 初版
-- Audit Logger 边界
-- Metrics Collector 边界
+- Audit Logger 持久化，已记录 Agent Run 生命周期、工具调用、权限拦截和 SQL 安全拦截
+- Metrics Collector 持久化，已记录模型 provider、model、token、latency、cost 和状态
 - Admin Runtime Config 接口
 
 当前版本尚未具备：
@@ -1208,29 +1211,28 @@ GET /api/v1/admin/runtime-config
 
 ```text
 agent_runs
-- id
+- run_id
 - user_id
-- tenant_id
-- agent_id
+- question
 - status
+- final_answer
+- error_message
 - started_at
 - completed_at
+- duration_ms
+- input_tokens
+- output_tokens
 - total_tokens
-- total_cost_usd
-- latency_ms
-- error_message
+- cost_usd
 
 agent_run_events
 - id
 - run_id
 - event_type
-- sequence_no
-- payload_json
-- status
-- latency_ms
+- payload
 - created_at
 
-agent_model_calls
+agent_metrics
 - id
 - run_id
 - provider
@@ -1241,27 +1243,21 @@ agent_model_calls
 - cost_usd
 - latency_ms
 - status
-- error_code
-- created_at
-
-agent_tool_calls
-- id
-- run_id
-- tool_name
-- input_json
-- output_json
-- status
-- latency_ms
 - error_message
+- details
 - created_at
 
 agent_audit_logs
 - id
+- run_id
 - user_id
+- username
+- tenant_id
 - action
 - resource_type
 - resource_id
-- metadata_json
+- outcome
+- metadata
 - created_at
 ```
 
@@ -1314,9 +1310,10 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 ### 阶段 2：可观测性
 
 1. 新增 `agent_runs` 和 `agent_run_events` 表
-2. 新增 token、cost、latency 采集
-3. 新增 Superset Usage Dashboard
-4. 新增错误中心和慢调用分析
+2. 新增 `agent_metrics` 表，持久化 token、cost、latency、provider、model 和状态
+3. 新增 `agent_audit_logs` 表，持久化 Agent Run 生命周期、工具调用和安全拦截审计
+4. 待新增 Superset Usage Dashboard
+5. 待新增错误中心和慢调用分析
 
 ### 阶段 3：安全治理
 
@@ -1324,7 +1321,7 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 2. 完善 RBAC 和 tenant 隔离
 3. 已使用 `sqlglot` AST 强化 SQL Guard，并限制最大返回行数
 4. 增加高风险工具审批
-5. 增加审计日志持久化
+5. 已增加审计日志持久化
 
 ### 阶段 4：智能能力
 
