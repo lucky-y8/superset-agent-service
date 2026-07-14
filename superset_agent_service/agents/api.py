@@ -258,6 +258,9 @@ def _token_from_query(websocket: WebSocket) -> str | None:
     兼容通过查询参数传 Token 的客户端，但更推荐放在消息体中。
     """
 
+    if not settings.ALLOW_WEBSOCKET_QUERY_TOKEN:
+        return None
+
     for key in ("token", "agent_token", "access_token"):
         value = websocket.query_params.get(key)
         if value:

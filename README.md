@@ -721,6 +721,165 @@ superset-agent-service/
 
 ## 安装与配置
 
+### Docker 服务器部署
+
+项目根目录已经提供：
+
+- `Dockerfile`：构建非 root 的 Agent Service 生产镜像。
+- `compose.yaml`：启动 PostgreSQL、Qdrant、Redis、Agent Service 和 Nginx。
+- `.env.docker.example`：服务器环境变量模板，不包含真实密钥。
+- `docker/entrypoint.sh`：校验密钥、执行 Alembic 迁移并启动 Uvicorn。
+- `docker/nginx.conf`：HTTP、WebSocket、上传大小限制和基础限流配置。
+
+Compose 只向宿主机公开 Nginx，PostgreSQL `5432`、Qdrant `6333`、Redis
+`6379` 和 Agent `9003` 均只在 Docker 网络中访问。
+
+#### 1. 准备服务器配置
+
+```bash
+cp .env.docker.example .env
+chmod 600 .env
+nano .env
+```
+
+必须替换所有 `CHANGE_ME`。如果 PostgreSQL、Redis 和 Qdrant 暂时使用同一密码，分别把
+`POSTGRES_PASSWORD`、`REDIS_PASSWORD`、`QDRANT_API_KEY` 填成同一个值即可；真实密码只
+保存在服务器 `.env`，不要写入 `compose.yaml`、Dockerfile、README 或 Git。
+
+还需要重点修改：
+
+- `CORS_ALLOWED_ORIGINS`：填写 Superset 前端的正式来源，例如
+  `https://superset.example.com`，不要填写 `*`。
+- `SUPERSET_MCP_URL`：Superset MCP 的容器可访问地址。
+- `SUPERSET_AGENT_TOKEN_VERIFY_URL`：Superset Agent Token 验证地址。
+- DeepSeek、DashScope、OSS 的新密钥；已经暴露过的旧密钥不要继续使用。
+- `PUBLIC_PORT`：默认 `8080`，可以按服务器端口规划调整。
+- `ALLOW_WEBSOCKET_QUERY_TOKEN=false`：生产环境拒绝 URL 查询参数中的 Token，前端应在
+  WebSocket 建立后发送的认证/运行消息中携带 Token。
+
+Agent 和 Superset 在同一台 Linux 服务器、Superset/MCP 运行在宿主机时，可以保留
+`host.docker.internal`。Compose 已通过 `host-gateway` 增加该域名；如果 Superset 在
+其他服务器，应改成可从 Agent 容器访问的内网 HTTPS 地址。
+
+#### 2. 一键启动
+
+Docker Compose V2：
+
+```bash
+docker compose up -d --build
+```
+
+如果服务器访问 Docker Hub 出现 `EOF` 或超时，先验证基础镜像拉取：
+
+```bash
+docker pull python:3.13-slim
+docker pull postgres:16-alpine
+docker pull redis:7-alpine
+docker pull qdrant/qdrant:v1.14.1
+docker pull nginx:1.27-alpine
+```
+
+仍然失败时，需要在服务器 Docker Daemon 配置可信的镜像加速器或出网代理，然后重启
+Docker 再执行 Compose；这属于服务器访问 Docker Hub 的网络问题，不需要修改项目代码。
+
+项目也允许在 `.env` 中直接替换每个镜像地址：
+
+```env
+PYTHON_BASE_IMAGE=你的镜像仓库/python:3.13-slim
+POSTGRES_IMAGE=你的镜像仓库/postgres:16-alpine
+REDIS_IMAGE=你的镜像仓库/redis:7-alpine
+QDRANT_IMAGE=你的镜像仓库/qdrant:v1.14.1
+NGINX_IMAGE=你的镜像仓库/nginx:1.27-alpine
+PIP_INDEX_URL=你的可信Python包镜像/simple
+```
+
+如果服务器完全不能访问任何容器仓库，可以在一台能够联网且 CPU 架构相同的机器上执行：
+
+```bash
+docker pull python:3.13-slim
+docker pull postgres:16-alpine
+docker pull redis:7-alpine
+docker pull qdrant/qdrant:v1.14.1
+docker pull nginx:1.27-alpine
+docker save -o superset-agent-images.tar \
+  python:3.13-slim postgres:16-alpine redis:7-alpine \
+  qdrant/qdrant:v1.14.1 nginx:1.27-alpine
+```
+
+把 `superset-agent-images.tar` 上传到服务器后执行：
+
+```bash
+docker load -i superset-agent-images.tar
+docker compose up -d --build
+```
+
+离线加载只解决基础镜像；构建 Agent 仍需要下载 `requirements.txt` 中的 Python 包。完全
+离线的服务器还需要提前制作 wheelhouse，或者直接在联网机器构建 Agent 镜像后通过
+`docker save` / `docker load` 把最终镜像传到服务器。
+
+旧版独立 Compose：
+
+```bash
+docker-compose up -d --build
+```
+
+Agent 容器启动时会自动执行：
+
+```bash
+python -m alembic upgrade head
+```
+
+如果 `.env` 仍有空密钥或 `CHANGE_ME` 占位符，Agent 会拒绝启动并在日志中指出变量名，
+但不会打印密钥内容。
+
+#### 3. 检查状态
+
+```bash
+docker compose ps
+docker compose logs -f agent
+curl http://127.0.0.1:8080/api/v1/health
+```
+
+联调地址：
+
+- Usage Dashboard：`http://服务器IP:8080/usage`
+- API 文档：`http://服务器IP:8080/docs`
+- WebSocket：`ws://服务器IP:8080/api/v1/agents/ws`
+
+生产环境默认设置 `ENABLE_DEBUG_UI=false`，因此不会开放具备底层 MCP 调用能力的
+`/debug` 页面。`/usage` 可以通过 `ENABLE_USAGE_UI=true` 单独开放，其数据接口仍要求
+经过 Superset 验证且拥有 Admin 角色的 Agent Token。
+
+#### 4. 公网安全要求
+
+内置 Nginx 默认提供 HTTP，适合内网或限制来源 IP 的联调环境。真正对互联网开放时，
+必须在 `8080` 前增加云负载均衡或 HTTPS Nginx，并满足以下条件：
+
+- 安全组只开放 `80/443` 或临时联调端口，禁止开放 `5432/6333/6379/9003`。
+- 临时 HTTP 联调必须限制允许访问的公网 IP，不能对全网开放 Agent Token。
+- WebSocket 同样使用 `wss://`，避免 Token 和对话内容明文传输。
+- 定期轮换 PostgreSQL、Redis、Qdrant、模型和 OSS 密钥。
+- 生产模板已设置 `ALLOW_WEBSOCKET_QUERY_TOKEN=false`，避免 Token 出现在访问日志和
+  浏览器历史中；现有 Superset 前端若仍把 Token 拼在 WebSocket URL 上，需要同步改为
+  在连接后的认证/运行消息中发送。
+
+#### 5. 更新和停止
+
+```bash
+git pull
+docker compose up -d --build
+docker compose logs --tail=200 agent
+```
+
+停止容器但保留数据卷：
+
+```bash
+docker compose down
+```
+
+不要在生产环境随意执行 `docker compose down -v`，该命令会删除 PostgreSQL、Qdrant
+和 Redis 的持久化卷。升级前应先完成 PostgreSQL 与 Qdrant 备份。
+
 ### 1. 环境要求
 
 - Python 3.10+

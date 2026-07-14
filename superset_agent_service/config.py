@@ -30,10 +30,26 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "local"
     LOG_LEVEL: str = "INFO"
 
+    # Comma-separated browser origins allowed to call the public Agent API.
+    # 允许调用对外 Agent API 的浏览器来源，多个域名使用英文逗号分隔。
+    CORS_ALLOWED_ORIGINS: str = "http://127.0.0.1:9000,http://localhost:9000"
+    # Keep the powerful MCP debug console disabled on public deployments.
+    # 对外部署时默认关闭具备底层 MCP 调试能力的 Debug 页面。
+    ENABLE_DEBUG_UI: bool = False
+    # The read-only Usage page can be enabled independently in production.
+    # 生产环境可以单独开启只读 Usage 页面，其数据接口仍要求管理员 Token。
+    ENABLE_USAGE_UI: bool = False
+    # Query-string tokens are convenient locally but can leak through URL logs.
+    # 查询参数 Token 便于本地调试，但可能通过 URL 日志泄露，生产环境应关闭。
+    ALLOW_WEBSOCKET_QUERY_TOKEN: bool = True
+
     SECRET_KEY: str = Field(default="change-me-in-env")
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 
     DATABASE_URL: str = "sqlite+aiosqlite:///./superset_agent_service.db"
+    # Reserved for the upcoming distributed cache and task queue integration.
+    # 为后续分布式缓存和任务队列接入预留；当前业务代码尚未使用 Redis。
+    REDIS_URL: str | None = None
 
     SUPERSET_MCP_URL: str | None = None
     SUPERSET_MCP_TOKEN: str | None = None
@@ -99,6 +115,19 @@ class Settings(BaseSettings):
     OSS_ACCESS_KEY_ID: str | None = None
     OSS_ACCESS_KEY_SECRET: str | None = None
     OSS_PREFIX: str = "superset-agent-knowledge"
+
+    @property
+    def cors_allowed_origins(self) -> list[str]:
+        """Return normalized origins for Starlette CORS middleware.
+
+        返回供 Starlette CORS 中间件使用的规范化来源列表。
+        """
+
+        return [
+            origin.strip()
+            for origin in self.CORS_ALLOWED_ORIGINS.split(",")
+            if origin.strip()
+        ]
 
     @field_validator("SUPERSET_MCP_URL", mode="before")
     @classmethod

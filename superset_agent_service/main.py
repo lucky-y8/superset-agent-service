@@ -55,7 +55,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,7 +63,11 @@ app.add_middleware(
 
 app.include_router(api_router, prefix=settings.API_V1_PREFIX)
 
-if settings.ENVIRONMENT.lower() in {"local", "development", "test"}:
+is_local_environment = settings.ENVIRONMENT.lower() in {"local", "development", "test"}
+serve_debug_ui = is_local_environment or settings.ENABLE_DEBUG_UI
+serve_usage_ui = is_local_environment or settings.ENABLE_USAGE_UI
+
+if serve_debug_ui or serve_usage_ui:
     # StaticFiles serves CSS and JavaScript without introducing a separate
     # frontend build tool.  The entire console is local-only because its MCP
     # tool caller intentionally exposes low-level development capabilities.
@@ -71,6 +75,7 @@ if settings.ENVIRONMENT.lower() in {"local", "development", "test"}:
     # 暴露了底层 MCP 调试能力，所以整个页面只在本地开发环境启用。
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+if serve_debug_ui or serve_usage_ui:
     @app.get("/", include_in_schema=False)
     async def root() -> RedirectResponse:
         """Make the development console the convenient local entry point.
@@ -78,8 +83,9 @@ if settings.ENVIRONMENT.lower() in {"local", "development", "test"}:
         将开发控制台设置为便捷的本地入口。
         """
 
-        return RedirectResponse(url="/debug")
+        return RedirectResponse(url="/debug" if serve_debug_ui else "/usage")
 
+if serve_debug_ui:
     @app.get("/debug", include_in_schema=False)
     async def debug_console() -> FileResponse:
         """Return the local Agent/MCP development console.
@@ -89,6 +95,7 @@ if settings.ENVIRONMENT.lower() in {"local", "development", "test"}:
 
         return FileResponse(STATIC_DIR / "debug.html")
 
+if serve_usage_ui:
     @app.get("/usage", include_in_schema=False)
     async def usage_dashboard() -> FileResponse:
         """Return the local operational Usage Dashboard.

@@ -232,6 +232,53 @@ class AgentWebSocketTests(unittest.TestCase):
         self.assertEqual(captured_contexts[0].user_id, "query-user")
         self.assertEqual(captured_contexts[0].mcp_bearer_token, "query-token")
 
+    def test_socket_ignores_query_token_when_production_switch_is_disabled(self):
+        """Require message-body authentication when URL tokens are disabled.
+
+        生产环境关闭 URL Token 后，只允许使用 WebSocket 消息体中的 Token 认证。
+        """
+
+        verified_context = PermissionContext(
+            user_id="message-user",
+            roles=["Admin"],
+            mcp_bearer_token="message-token",
+        )
+
+        with patch(
+            "superset_agent_service.agents.api.AgentService",
+            FakeStreamingAgentService,
+        ), patch(
+            "superset_agent_service.agents.api.settings.SUPERSET_AGENT_TOKEN_VERIFY_URL",
+            "http://superset.local/api/v1/agent/token/verify",
+        ), patch(
+            "superset_agent_service.agents.api.settings.ALLOW_WEBSOCKET_QUERY_TOKEN",
+            False,
+        ), patch(
+            "superset_agent_service.agents.api.token_verifier.verify",
+            new=AsyncMock(return_value=verified_context),
+        ) as verify:
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/api/v1/agents/ws?agent_token=ignored-query-token"
+                ) as socket:
+                    self.assertEqual(socket.receive_json(), {"type": "connected"})
+                    socket.send_json(
+                        {
+                            "type": "run",
+                            "token": "message-token",
+                            "request": {
+                                "question": "list dashboards",
+                                "filters": {},
+                            },
+                        }
+                    )
+                    while True:
+                        message = socket.receive_json()
+                        if message["type"] == "final":
+                            break
+
+        verify.assert_awaited_once_with("message-token")
+
 
 if __name__ == "__main__":
     unittest.main()
