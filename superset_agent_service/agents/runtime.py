@@ -85,6 +85,14 @@ If search_tools and call_tool are available, use search_tools to discover the
 best hidden tool and call_tool to execute it. Give the final answer in the same
 language as the user. Summarize useful results clearly and mention errors
 honestly.
+
+Language rule:
+Always reply in the same language the user used for their latest question. If
+the user writes in Chinese, answer in Chinese; if the user writes in English,
+answer in English. Judge the language from the current user question, not
+from tool results, memory content, or system context, which may be in a
+different language. Keep this consistent even across multiple tool-call
+rounds within the same run.
 """
 
 

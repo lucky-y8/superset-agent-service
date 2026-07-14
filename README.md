@@ -686,6 +686,23 @@ superset-agent-service/
 | `metrics/models.py` | `agent_metrics` ORM 模型 |
 | `metrics/collector.py` | 模型调用指标采集服务，记录 token、成本、延迟、模型和状态 |
 
+### `evaluations`
+
+| 文件 | 说明 |
+| --- | --- |
+| `evaluations/models.py` | `agent_evaluation_cases`、`agent_evaluation_results` ORM 模型 |
+| `evaluations/schemas.py` | 评估用例、运行评分和结果响应模型 |
+| `evaluations/service.py` | 根据答案关键词、禁止词和 Run Trace 工具调用进行确定性自动评分 |
+| `evaluations/api.py` | 评估用例管理、运行评分和结果查询接口 |
+
+### `usage`
+
+| 文件 | 说明 |
+| --- | --- |
+| `usage/schemas.py` | Usage Dashboard 聚合响应模型 |
+| `usage/service.py` | 聚合 Run、Metrics、Audit 和 Evaluation 数据 |
+| `usage/api.py` | 管理员 Usage Dashboard 查询接口 |
+
 ### `admin`
 
 | 文件 | 说明 |
@@ -805,7 +822,8 @@ CREATE DATABASE superset_agent_service;
 
 这条命令只创建空数据库。项目表结构由 Alembic 管理，不需要手动创建
 `agent_runs`、`agent_run_events`、`knowledge_documents`、`knowledge_chunks`、
-`agent_memories`、`agent_metrics` 或 `agent_audit_logs` 表。
+`agent_memories`、`agent_metrics`、`agent_audit_logs`、`agent_evaluation_cases`
+或 `agent_evaluation_results` 表。
 
 ### 5. 使用 Alembic 创建和迁移表结构
 
@@ -823,7 +841,7 @@ CREATE DATABASE superset_agent_service;
 - 按顺序执行尚未执行的迁移脚本。
 - 首次执行时创建 `alembic_version`、`agent_runs`、`agent_run_events`、
   `knowledge_documents`、`knowledge_chunks`、`agent_memories`、`agent_metrics`
-  和 `agent_audit_logs`。
+  、`agent_audit_logs`、`agent_evaluation_cases` 和 `agent_evaluation_results`。
 - `head` 表示升级到当前代码包含的最新迁移版本。
 
 #### 查看数据库当前迁移版本
@@ -835,7 +853,7 @@ CREATE DATABASE superset_agent_service;
 用途：查看数据库已经执行到哪个版本。当前项目正常应显示：
 
 ```text
-20260629_0005 (head)
+20260713_0006 (head)
 ```
 
 #### 查看全部迁移历史
@@ -886,6 +904,7 @@ CREATE DATABASE superset_agent_service;
 访问：
 
 - Agent 调试页面：http://127.0.0.1:30000/debug
+- Agent Usage Dashboard：http://127.0.0.1:30000/usage
 - API 文档：http://127.0.0.1:30000/docs
 - OpenAPI JSON：http://127.0.0.1:30000/api/v1/openapi.json
 - 健康检查：http://127.0.0.1:30000/api/v1/health
@@ -905,9 +924,71 @@ http://127.0.0.1:30000/debug
 - `superset_agent_service/static/debug.css`
 - `superset_agent_service/static/debug.js`
 
-当前 `/debug` 页面主要覆盖 Agent 对话测试，还没有加入 RAG 文件上传控件。
-RAG 上传和检索第一版先通过 `/api/v1/rag/documents`、`/api/v1/rag/search`
-接口测试；后续可以把知识库上传、文档列表和检索结果展示集成到该页面或 Superset 前端页面。
+当前 `/debug` 页面覆盖 Agent 对话、MCP 工具、RAG 文件上传与检索、长期记忆和
+Run Trace。`/usage` 页面用于查看运行成功率、耗时、Token、成本、模型、工具、
+错误排行和自动评估通过率。
+
+### 8. 自动评估
+
+第一版自动评估使用确定性规则，不会为了评分再次调用大模型，因此评分可复现且不会
+额外消耗模型 Token。先创建评估用例：
+
+```http
+POST /api/v1/evaluations/cases
+Authorization: Bearer <agent-token>
+Content-Type: application/json
+
+{
+  "name": "查询前五个仪表盘",
+  "question": "请查询前五个仪表盘",
+  "expected_tools": ["list_dashboards"],
+  "expected_answer_contains": ["ID", "标题"],
+  "forbidden_answer_contains": ["没有权限"],
+  "minimum_score": 0.8
+}
+```
+
+Agent 请求执行完成并取得 `run_id` 后，对该 Run 自动评分：
+
+```http
+POST /api/v1/evaluations/cases/{case_id}/evaluate
+Authorization: Bearer <agent-token>
+Content-Type: application/json
+
+{
+  "run_id": "<run-id>"
+}
+```
+
+也可以让评估系统自动执行 Agent 并立即评分，不需要提前准备 `run_id`：
+
+```http
+POST /api/v1/evaluations/cases/{case_id}/execute
+Authorization: Bearer <agent-token>
+```
+
+该接口会使用当前认证管理员的 Superset 权限执行真实 Agent，因此会产生正常的模型 Token、
+MCP 调用、Run Trace、Metrics 和 Audit 数据。适合上线前回归验证；只想评估历史运行时使用
+前面的 `/evaluate` 接口，不会重复调用模型。
+
+同时配置答案和工具规则时，答案占 60%，工具轨迹占 40%；只配置其中一类时，该类占
+全部分数。运行失败或答案命中禁止词时总分直接为 0。评估结果会写入
+`agent_evaluation_results`，并自动进入 Usage Dashboard 统计。
+
+### 9. Usage Dashboard
+
+```http
+GET /api/v1/usage/dashboard?days=30
+Authorization: Bearer <agent-token>
+```
+
+该接口仅允许 Admin 角色访问，一次返回核心指标、每日趋势、模型表现、工具执行、错误
+排行和评估统计。项目内置 `/usage` 页面直接消费该接口，支持 7、30、90 天切换。
+
+如果需要在 Apache Superset 中创建原生 Dashboard，可把 PostgreSQL 中的
+`agent_runs`、`agent_metrics`、`agent_audit_logs` 和 `agent_evaluation_results`
+注册为 Superset Dataset，再基于同一批事实表制作运营图表；内置 `/usage` 页面不替代
+Superset 原生 Dashboard，而是提供开箱即用的运维视图。
 
 ## API 文档
 
@@ -1177,33 +1258,34 @@ GET /api/v1/admin/runtime-config
 - FastAPI 应用入口
 - API 路由聚合
 - 环境变量配置
-- 临时用户权限上下文
-- Agent chat 接口
-- Run 创建和事件记录
-- Run trace 查询
-- Tool Registry 边界
-- Skills 业务能力层边界
-- MCP Client 边界
-- Superset MCP Client 工厂
-- RAG Retriever 边界
-- SQL Guard 初版
-- Policy Guard 初版
+- Superset Agent Token 校验和用户权限上下文
+- HTTP Agent chat 和 WebSocket 实时对话接口
+- DeepSeek OpenAI-compatible 模型调用
+- Superset MCP tool list、tool call 和 Bearer Token 传递
+- LangGraph Planner + ReAct + Reflection 工作流
+- 引导式创建任务 Planner，可通过 `AGENT_GUIDED_MODE` 开关控制
+- SQL Guard AST 校验、只读限制和最大返回行数限制
+- Policy Guard，并支持将业务工具权限委托给 Superset MCP
+- PostgreSQL Run / Event 数据库持久化和 Run Trace 查询
+- 通义 Embedding + Qdrant + PostgreSQL + 阿里云 OSS 的 RAG 知识库
+- 基于 Qdrant 的用户长期语义记忆
 - Audit Logger 持久化，已记录 Agent Run 生命周期、工具调用、权限拦截和 SQL 安全拦截
 - Metrics Collector 持久化，已记录模型 provider、model、token、latency、cost 和状态
+- Debug 对话页面、实时执行时间线和 Run Trace 页面
+- SQL Guard、Runtime、WebSocket、MCP、Run、Memory 和 Observability 测试
+- 确定性自动评估用例、评分结果和 Usage Dashboard 聚合
 - Admin Runtime Config 接口
 
 当前版本尚未具备：
 
-- 真实登录注册
-- 真实 Superset MCP tool 调用
-- 真实 LangGraph 工作流
-- 真实 Skill workflow 实现
-- 真实 LLM 模型调用
-- RAG 向量库接入
-- Run / Event 数据库持久化
-- Usage Superset Dashboard
-- 完整 RBAC / SSO / JWT
-- 单元测试和集成测试
+- Superset Usage Dashboard、错误中心和慢调用分析
+- 模型路由、故障自动降级、限流和熔断
+- 企业级 RAG 部门、项目空间、文档 ACL 和审批流程
+- 高风险写操作的人工审批机制
+- RAG 文件上传、文档管理和检索结果前端页面
+- 固定评估数据集、回答质量评分和自动回归评估
+- Docker、CI/CD、生产日志采集和备份恢复方案
+- 完整的 Skill 业务工作流编排
 
 ## 数据模型规划
 
@@ -1312,8 +1394,8 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 1. 新增 `agent_runs` 和 `agent_run_events` 表
 2. 新增 `agent_metrics` 表，持久化 token、cost、latency、provider、model 和状态
 3. 新增 `agent_audit_logs` 表，持久化 Agent Run 生命周期、工具调用和安全拦截审计
-4. 待新增 Superset Usage Dashboard
-5. 待新增错误中心和慢调用分析
+4. 已新增内置 Usage Dashboard 和 Superset 原生 Dashboard 数据基础
+5. 已新增错误排行、模型延迟与工具失败分析
 
 ### 阶段 3：安全治理
 
@@ -1328,10 +1410,10 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 1. 已接入第一版 RAG：通义 `text-embedding-v4`、Qdrant、PostgreSQL、阿里云 OSS
 2. 已接入长期语义记忆：每轮对话通过通义 `text-embedding-v4` 向量化，按用户写入 Qdrant `superset_agent_memory` 集合
 3. 已接入建图任务专项策略：Runtime 会识别查询、RAG、建图、建看板任务，并为建图任务注入 `chart_context`
-4. 加 Reflection 节点
-5. 加 Planner 节点
-6. 加模型路由和 fallback
-7. 加评估数据集和自动测试
+4. 已增加 Reflection 节点
+5. 已增加 Planner 节点
+6. 待增加模型路由和 fallback
+7. 已增加确定性评估用例和 Run 自动评分；待增加批量调度与版本间回归对比
 
 ## 开发备注
 
@@ -1347,5 +1429,7 @@ Superset MCP 负责提供 Superset 工具能力，Agent Service 负责：
 - 当前 `AGENT_GUIDED_MODE=false` 默认关闭；改为 `true` 后，创建数据集、图表、看板会先进入独立 Planner 节点。Planner 会生成结构化计划和缺失信息列表，缺少数据库连接、数据来源、图表类型、看板名称等必要信息时先提问，信息齐全后才进入 ReAct 工具执行。
 - 当前 `AGENT_DELEGATE_AUTH_TO_MCP=true` 默认开启，业务工具权限交给 Superset MCP 判断；Agent Service 仍校验 Token、执行 SQLGuard/Reflection，但不再把 Token verify 返回的 `allowed_tools` 当作 MCP 工具白名单，避免“工具可见但 Agent 自己拒绝调用”。
 - 当前 Runtime 已接入 Reflection 节点：每轮工具执行后会检查 observation，权限错误和危险 SQL 会立即停止，可恢复的参数/工具错误会交回模型进行一次修正。
-- Runtime 相关单测可使用 `D:\App\python3.13\python.exe -B -m unittest discover -s test -p 'test_agent_runtime.py' -v` 运行。
+- Runtime 相关单测可使用 `D:\App\python3.13\python.exe -B -m unittest discover -s tests -p 'test_agent_runtime.py' -v` 运行。
+- 全部常规测试可使用 `D:\App\python3.13\python.exe -B -m unittest discover -s tests -p 'test_*.py' -v` 运行。
+- 在线 MCP 集成测试默认跳过；确认 MCP 服务和 Token 可用后，设置 `RUN_MCP_INTEGRATION_TESTS=true` 再运行测试。
 

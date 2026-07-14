@@ -89,6 +89,15 @@ if settings.ENVIRONMENT.lower() in {"local", "development", "test"}:
 
         return FileResponse(STATIC_DIR / "debug.html")
 
+    @app.get("/usage", include_in_schema=False)
+    async def usage_dashboard() -> FileResponse:
+        """Return the local operational Usage Dashboard.
+
+        返回本地 Agent 运营指标看板。
+        """
+
+        return FileResponse(STATIC_DIR / "usage.html")
+
 
 if __name__ == "__main__":
     # Use the full import path here.  The previous "main:app" value only works

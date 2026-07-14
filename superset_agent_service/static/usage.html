@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superset Agent Usage</title>
+  <link rel="stylesheet" href="/static/usage.css?v=20260713-1">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">S</span>
+        <div><strong>Superset Agent</strong><span>Usage Console</span></div>
+      </div>
+      <nav aria-label="运营导航">
+        <a class="nav-link active" href="/usage">Usage 概览</a>
+        <a class="nav-link" href="/debug">Agent 对话</a>
+        <a class="nav-link" href="/docs">API 文档</a>
+      </nav>
+      <div class="auth-box">
+        <label for="agent-token">Agent Token</label>
+        <textarea id="agent-token" rows="4" placeholder="生产环境填写 Bearer Token"></textarea>
+        <button id="save-token" type="button">保存 Token</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><h1>Agent Usage</h1><p id="subtitle">运行质量、成本与工具使用情况</p></div>
+        <div class="toolbar">
+          <div class="range-control" role="group" aria-label="统计周期">
+            <button type="button" data-days="7">7 天</button>
+            <button class="active" type="button" data-days="30">30 天</button>
+            <button type="button" data-days="90">90 天</button>
+          </div>
+          <button id="refresh" class="primary" type="button">刷新</button>
+        </div>
+      </header>
+
+      <section class="kpi-grid" aria-label="核心指标">
+        <article><span>运行次数</span><strong id="total-runs">-</strong><small id="run-breakdown">等待数据</small></article>
+        <article><span>成功率</span><strong id="success-rate">-</strong><small>已完成运行占比</small></article>
+        <article><span>平均耗时</span><strong id="avg-duration">-</strong><small>端到端运行时间</small></article>
+        <article><span>Token</span><strong id="total-tokens">-</strong><small>模型调用总量</small></article>
+        <article><span>模型成本</span><strong id="total-cost">-</strong><small>已返回的估算成本</small></article>
+        <article><span>评估通过率</span><strong id="eval-rate">-</strong><small id="eval-breakdown">尚无评估</small></article>
+      </section>
+
+      <section class="band trend-band">
+        <div class="section-heading"><div><h2>运行趋势</h2><p>按天查看运行量与失败量</p></div><span id="updated-at">尚未刷新</span></div>
+        <div class="chart-wrap"><canvas id="trend-chart" aria-label="运行趋势图"></canvas><div id="chart-empty" class="empty">暂无趋势数据</div></div>
+      </section>
+
+      <section class="two-column">
+        <div class="band">
+          <div class="section-heading"><div><h2>模型表现</h2><p>调用量、Token、延迟与失败</p></div></div>
+          <div class="table-wrap"><table><thead><tr><th>模型</th><th>调用</th><th>Token</th><th>平均延迟</th><th>失败</th></tr></thead><tbody id="model-rows"></tbody></table></div>
+        </div>
+        <div class="band">
+          <div class="section-heading"><div><h2>工具执行</h2><p>MCP 工具成功、失败与拦截</p></div></div>
+          <div class="table-wrap"><table><thead><tr><th>工具</th><th>成功</th><th>失败</th><th>拦截</th></tr></thead><tbody id="tool-rows"></tbody></table></div>
+        </div>
+      </section>
+
+      <section class="two-column bottom-grid">
+        <div class="band">
+          <div class="section-heading"><div><h2>错误排行</h2><p>按错误信息聚合失败运行</p></div></div>
+          <ol id="error-list" class="error-list"></ol>
+        </div>
+        <div class="band evaluation-panel">
+          <div class="section-heading"><div><h2>自动评估</h2><p>确定性质量基线执行结果</p></div><a href="/docs#/evaluations">管理用例</a></div>
+          <div class="evaluation-meter"><div id="evaluation-bar"></div></div>
+          <dl><div><dt>评估总数</dt><dd id="eval-total">0</dd></div><div><dt>通过</dt><dd id="eval-passed">0</dd></div><div><dt>未通过</dt><dd id="eval-failed">0</dd></div><div><dt>平均得分</dt><dd id="eval-score">0%</dd></div></dl>
+        </div>
+      </section>
+      <div id="toast" class="toast" role="status"></div>
+    </main>
+  </div>
+  <script src="/static/usage.js?v=20260713-1"></script>
+</body>
+</html>

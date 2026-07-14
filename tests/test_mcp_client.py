@@ -1,23 +1,18 @@
 r"""Tests for the MCP transport and the configured local MCP endpoint.
 
-MCP 传输层和已配置本地 MCP 端点的测试。
+测试 MCP 传输层以及配置的本地 MCP 服务端点。
 
-The project does not yet depend on pytest, so these tests use Python's built-in
-``unittest`` module.  They can be executed with:
+Deterministic transport tests do not require a running server. The live MCP
+integration test runs only when ``RUN_MCP_INTEGRATION_TESTS=true`` is set, so a
+developer's expired local token cannot make the normal unit-test suite fail.
 
-    .venv\Scripts\python.exe -m unittest discover -s test -p "test_*.py"
-
-项目目前没有依赖 pytest，因此这些测试使用 Python 内置的 ``unittest`` 模块，
-并可通过上面的命令执行。
-
-The first group is deterministic and does not need a running server.  The last
-test is an integration check and is skipped when SUPERSET_MCP_URL is empty.
-
-第一组测试行为确定，不需要启动服务；最后一个测试是集成检查，当
-SUPERSET_MCP_URL 为空时会自动跳过。
+确定性的传输层测试不需要启动服务。只有显式设置
+``RUN_MCP_INTEGRATION_TESTS=true`` 时才执行在线 MCP 集成测试，避免开发机上的
+过期 Token 导致常规单元测试失败。
 """
 
 import asyncio
+import os
 import unittest
 
 from superset_agent_service.tools.mcp_client import MCPClient, MCPError
@@ -25,15 +20,15 @@ from superset_agent_service.tools.superset_mcp import get_superset_mcp_client
 
 
 class MCPResponseParsingTests(unittest.TestCase):
-    """Verify both response formats allowed by Streamable HTTP MCP.
+    """Verify response formats allowed by Streamable HTTP MCP.
 
-    验证 Streamable HTTP MCP 允许的两种响应格式。
+    验证 Streamable HTTP MCP 支持的响应格式。
     """
 
     def test_parse_json_response(self) -> None:
         """Parse a normal JSON-RPC response body.
 
-        解析普通 JSON-RPC 响应正文。
+        解析普通的 JSON-RPC 响应正文。
         """
 
         message = MCPClient._parse_response(
@@ -46,7 +41,7 @@ class MCPResponseParsingTests(unittest.TestCase):
     def test_parse_sse_response(self) -> None:
         """Parse a JSON-RPC result wrapped in one SSE event.
 
-        解析包装在单个 SSE 事件中的 JSON-RPC 结果。
+        解析封装在单个 SSE 事件中的 JSON-RPC 结果。
         """
 
         body = (
@@ -71,7 +66,7 @@ class MCPResponseParsingTests(unittest.TestCase):
     def test_parse_sse_skips_notifications_before_result(self) -> None:
         """Ignore progress notifications that precede the final result.
 
-        忽略最终结果之前出现的进度通知。
+        忽略最终结果之前的进度通知。
         """
 
         body = (
@@ -90,15 +85,15 @@ class MCPResponseParsingTests(unittest.TestCase):
         self.assertEqual(message["result"], {"content": []})
 
     def test_tool_call_accepts_non_object_json_result(self) -> None:
-        """Tool results may be arrays even though control methods use objects.
+        """Allow arrays as tool results even when control methods use objects.
 
-        即使控制方法返回对象，工具结果也可以是数组。
+        即使控制方法使用对象，工具调用结果也可以是数组。
         """
 
         class StubClient(MCPClient):
             """Replace network I/O with one fixed JSON response.
 
-            用固定 JSON 响应替代真实网络 I/O。
+            使用固定 JSON 响应替代真实网络 I/O。
             """
 
             def _post_json(self, headers, payload):
@@ -122,14 +117,18 @@ class MCPResponseParsingTests(unittest.TestCase):
 class ConfiguredMCPIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Exercise the same endpoint used by the development console.
 
-    测试开发控制台实际使用的同一个 MCP 端点。
+    测试开发控制台实际使用的 MCP 服务端点。
     """
 
     async def test_initialize_configured_mcp_server(self) -> None:
-        """Verify handshake and tool discovery when local MCP is configured.
+        """Verify handshake and tool discovery in an explicitly enabled run.
 
-        在已配置本地 MCP 时验证握手和工具发现。
+        在明确启用在线测试后验证 MCP 握手和工具发现。
         """
+
+        enabled = os.getenv("RUN_MCP_INTEGRATION_TESTS", "false").lower()
+        if enabled not in {"1", "true", "yes"}:
+            self.skipTest("set RUN_MCP_INTEGRATION_TESTS=true to run live MCP tests")
 
         client = get_superset_mcp_client()
         if client is None:
